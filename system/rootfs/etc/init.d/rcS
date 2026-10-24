@@ -57,6 +57,10 @@ mount_data() {
         mount -t exfat -o noatime "$dev" /data || { log "$dev: still not mountable"; return 1; }
     fi
     log "data $dev mounted on /data"
+    # The layout RetroArch is configured for (etc/retroarch.cfg), so a
+    # fresh card shows where things go.
+    mkdir -p /data/roms/n64 /data/roms/psx /data/roms/saturn /data/bios \
+             /data/playlists /data/saves /data/states
 }
 mount_data
 

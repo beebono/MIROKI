@@ -1,0 +1,19 @@
+# Software Information
+display_name = "Nintendo - Nintendo 64 (Mupen64Plus-pow2)"
+authors = "Mupen64Plus contributors|m4xw|pow2 contributors"
+supported_extensions = "n64|v64|z64|bin|u1|ndd"
+corename = "Mupen64Plus-pow2"
+categories = "Emulator"
+license = "GPLv2"
+permissions = ""
+
+# Hardware Information
+manufacturer = "Nintendo"
+systemname = "Nintendo 64"
+systemid = "n64"
+
+# Libretro Features
+database = "Nintendo - Nintendo 64"
+supports_no_game = "false"
+savestate = "true"
+savestate_features = "basic"

@@ -39,6 +39,8 @@ FIRMWARE_DIR="$REPO_ROOT/system/prebuilts/firmware"
 SKEL_DIR="$REPO_ROOT/system/rootfs"
 BLOBS_DIR="$REPO_ROOT/system/prebuilts/libmali-blobs"
 RETROARCH="$OUT_DIR/retroarch/retroarch"
+CORES_DIR="$OUT_DIR/cores"
+YABA_INFO="$REPO_ROOT/ext/retroarch/yabadabadoo/packaging/onion/RetroArch/.retroarch/cores/yabadabadoo_libretro.info"
 TOOLCHAIN_LIB="/usr/aarch64-linux-gnu/lib"
 MULTIARCH_LIB="/usr/lib/aarch64-linux-gnu"
 CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}"
@@ -48,6 +50,7 @@ JOBS="${JOBS:-$(nproc)}"
 [ -f "$EXFAT_SRC/configure.ac" ] || { echo "ERROR: exfatprogs not checked out at $EXFAT_SRC" >&2; exit 1; }
 [ -f "$UDEV0_SRC/udev.c" ] || { echo "ERROR: libudev-zero not checked out at $UDEV0_SRC" >&2; exit 1; }
 [ -x "$RETROARCH" ] || { echo "ERROR: no $RETROARCH (run tools/build_retroarch.sh)" >&2; exit 1; }
+ls "$CORES_DIR"/*_libretro.so >/dev/null 2>&1 || { echo "ERROR: no cores in $CORES_DIR (run tools/build_cores.sh)" >&2; exit 1; }
 [ -d "$MULTIARCH_LIB" ] || { echo "ERROR: no arm64 multiarch libraries in $MULTIARCH_LIB" >&2; exit 1; }
 
 # --- exfatprogs, static, built from a copy (autogen writes into the tree).
@@ -131,6 +134,12 @@ install -m 0755 "$RETROARCH" "$ROOT_DIR/usr/bin/retroarch"
 install -D -m 0644 -t "$ROOT_DIR/usr/share/miroki/fonts" \
 	"$REPO_ROOT/system/ramen/assets/fonts/Audiowide-Regular.ttf" \
 	"$REPO_ROOT/system/ramen/assets/fonts/OFL.txt"
+
+# --- cores: the .so files, plus the info files RetroArch uses to match
+# content to cores (two are MIROKI's own, in the skeleton; yabadabadoo
+# ships its own) ---
+install -D -m 0644 -t "$ROOT_DIR/usr/lib/libretro" "$CORES_DIR"/*_libretro.so
+install -D -m 0644 -t "$ROOT_DIR/usr/share/libretro/info" "$YABA_INFO"
 
 # --- shared library closure: copy every missing DT_NEEDED, toolchain first,
 # then multiarch, until nothing new turns up ---

@@ -1,0 +1,42 @@
+diff --git a/Makefile.common b/Makefile.common
+index 57dabf5eac..20cffb5d44 100644
+--- a/Makefile.common
++++ b/Makefile.common
+@@ -1077,6 +1077,11 @@ ifeq ($(HAVE_MENU), 1)
+       HAVE_MENU_SCREENSAVER = 1
+    endif
+ 
++   ifeq ($(HAVE_RAMEN), 1)
++      OBJ += menu/drivers/ramen.o
++      DEFINES += -DHAVE_RAMEN
++   endif
++
+    ifeq ($(HAVE_MENU_SCREENSAVER), 1)
+       OBJ += menu/menu_screensaver.o
+    endif
+diff --git a/menu/menu_driver.c b/menu/menu_driver.c
+index a4b23c10ab..bbc942078f 100644
+--- a/menu/menu_driver.c
++++ b/menu/menu_driver.c
+@@ -328,6 +328,9 @@ static menu_ctx_driver_t menu_ctx_null = {
+ 
+ /* Menu drivers */
+ const menu_ctx_driver_t *menu_ctx_drivers[] = {
++#if defined(HAVE_RAMEN)
++   &menu_ctx_ramen,
++#endif
+ #if defined(HAVE_MATERIALUI)
+    &menu_ctx_mui,
+ #endif
+diff --git a/menu/menu_driver.h b/menu/menu_driver.h
+index 21d958babd..9c72a10178 100644
+--- a/menu/menu_driver.h
++++ b/menu/menu_driver.h
+@@ -756,6 +756,7 @@ extern menu_ctx_driver_t menu_ctx_ozone;
+ extern menu_ctx_driver_t menu_ctx_rgui;
+ extern menu_ctx_driver_t menu_ctx_mui;
+ extern menu_ctx_driver_t menu_ctx_xmb;
++extern menu_ctx_driver_t menu_ctx_ramen;
+ 
+ RETRO_END_DECLS
+ 

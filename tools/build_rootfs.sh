@@ -126,8 +126,11 @@ install -m 0755 "$OUT_DIR/aggregator/miroki-inputd" "$ROOT_DIR/usr/bin/miroki-in
 install -m 0755 "$OUT_DIR/tmix/tmix" "$ROOT_DIR/usr/bin/tmix"
 install -m 0755 "$OUT_DIR/tone/tone" "$ROOT_DIR/usr/bin/tone"
 
-# --- RetroArch ---
+# --- RetroArch, and ramen's font (OFL: the licence travels with it) ---
 install -m 0755 "$RETROARCH" "$ROOT_DIR/usr/bin/retroarch"
+install -D -m 0644 -t "$ROOT_DIR/usr/share/miroki/fonts" \
+	"$REPO_ROOT/system/ramen/assets/fonts/Audiowide-Regular.ttf" \
+	"$REPO_ROOT/system/ramen/assets/fonts/OFL.txt"
 
 # --- shared library closure: copy every missing DT_NEEDED, toolchain first,
 # then multiarch, until nothing new turns up ---

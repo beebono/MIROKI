@@ -10,6 +10,10 @@
 # their libEGL/libGLESv2/libgbm, whose sonames the libmali wrapper shims
 # provide on the device.
 #
+# The ramen menu driver lives in system/ramen/. Its ramen.c is copied into
+# menu/drivers/ and system/ramen/retroarch-hook.patch registers it; both are
+# undone after the build so the submodule stays clean.
+#
 # Output: build/cfw/retroarch/retroarch, which tools/build_rootfs.sh installs.
 #
 # Environment:
@@ -20,6 +24,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RA_DIR="$REPO_ROOT/ext/retroarch/launcher"
+RAMEN_DIR="$REPO_ROOT/system/ramen"
 OUT_DIR="$REPO_ROOT/build/cfw/retroarch"
 CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}"
 JOBS="${JOBS:-$(nproc)}"
@@ -28,6 +33,20 @@ JOBS="${JOBS:-$(nproc)}"
 command -v "${CROSS_COMPILE}pkg-config" >/dev/null || { echo "ERROR: ${CROSS_COMPILE}pkg-config not found" >&2; exit 1; }
 
 cd "$RA_DIR"
+
+# Hook ramen in, and take it back out again however the build ends.
+unhook_ramen() {
+	git apply -R --check "$RAMEN_DIR/retroarch-hook.patch" 2> /dev/null &&
+		git apply -R "$RAMEN_DIR/retroarch-hook.patch"
+	rm -f menu/drivers/ramen.c
+}
+trap unhook_ramen EXIT
+if git apply -R --check "$RAMEN_DIR/retroarch-hook.patch" 2> /dev/null; then
+	echo "ramen hook already applied (leftover from an interrupted build)"
+else
+	git apply "$RAMEN_DIR/retroarch-hook.patch"
+fi
+cp "$RAMEN_DIR/ramen.c" menu/drivers/ramen.c
 CFLAGS="-O2 -mcpu=cortex-a75.cortex-a55" CXXFLAGS="-O2 -mcpu=cortex-a75.cortex-a55" \
 ./configure --host="${CROSS_COMPILE%-}" --prefix=/usr \
 	--enable-kms --enable-egl \
@@ -44,7 +63,7 @@ CFLAGS="-O2 -mcpu=cortex-a75.cortex-a55" CXXFLAGS="-O2 -mcpu=cortex-a75.cortex-a
 	--disable-online_updater --disable-update_cores \
 	--disable-update_core_info --disable-update_assets \
 	--disable-materialui --disable-xmb
-make -j"$JOBS"
+make -j"$JOBS" HAVE_RAMEN=1
 
 mkdir -p "$OUT_DIR"
 install -m 0755 retroarch "$OUT_DIR/retroarch"

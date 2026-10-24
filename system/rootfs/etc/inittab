@@ -2,6 +2,9 @@
 # /sys already mounted.
 ::sysinit:/etc/init.d/rcS
 
+# Input aggregator: one virtual pad (buttons + rumble) for RetroArch.
+::respawn:/usr/bin/miroki-inputd
+
 # Debug shell on the USB serial gadget (ttyACM0 on the host).
 ttyGS0::respawn:/sbin/getty -n -l /bin/sh 115200 ttyGS0 vt100
 

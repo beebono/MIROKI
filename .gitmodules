@@ -28,3 +28,6 @@
 [submodule "ext/system/exfatprogs"]
 	path = ext/system/exfatprogs
 	url = https://github.com/exfatprogs/exfatprogs.git
+[submodule "ext/system/libudev-zero"]
+	path = ext/system/libudev-zero
+	url = https://github.com/illiliti/libudev-zero.git

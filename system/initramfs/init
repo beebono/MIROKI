@@ -37,7 +37,9 @@ fallback_shell() {
     mkdir -p /dev/pts
     mount -t devpts devpts /dev/pts
 
-    # g_serial is built in; ttyGS0 appears once the UDC binds.
+    # The composite gadget (ACM + mass storage) comes from configfs;
+    # ttyGS0 appears once it binds to the UDC.
+    usb-gadget start
     i=0
     while [ ! -e /dev/ttyGS0 ]; do
         i=$((i + 1))

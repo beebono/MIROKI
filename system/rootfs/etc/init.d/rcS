@@ -17,6 +17,12 @@ mount -t devpts devpts /dev/pts
 mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm
 mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
 mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+# The previous boot's oops, if any, from ramoops.
+mount -t pstore pstore /sys/fs/pstore 2> /dev/null
+
+# USB: ACM serial for the getty (inittab) plus the mass-storage LUN that
+# "usb-gadget storage on" hands /data to.
+usb-gadget start
 
 # Modules first. The audio nodes take their power domain from
 # sprd-audcp-boot (it boots the DSP with /lib/firmware/agdsp.bin) and stop

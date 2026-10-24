@@ -128,6 +128,7 @@ install -m 0755 "$UDEV0_BUILD/libudev.so.1" "$ROOT_DIR/usr/lib/libudev.so.1"
 install -m 0755 "$OUT_DIR/aggregator/miroki-inputd" "$ROOT_DIR/usr/bin/miroki-inputd"
 install -m 0755 "$OUT_DIR/tmix/tmix" "$ROOT_DIR/usr/bin/tmix"
 install -m 0755 "$OUT_DIR/tone/tone" "$ROOT_DIR/usr/bin/tone"
+install -m 0755 "$REPO_ROOT/system/initramfs/usb-gadget" "$ROOT_DIR/usr/sbin/usb-gadget"
 
 # --- RetroArch, and ramen's font (OFL: the licence travels with it) ---
 install -m 0755 "$RETROARCH" "$ROOT_DIR/usr/bin/retroarch"

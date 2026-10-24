@@ -1,0 +1,151 @@
+#!/bin/sh
+# usb-gadget: the device-side USB composite, built through configfs: an ACM
+# serial port (ttyGS0, the console getty) and a removable mass-storage LUN
+# for the data partition. One file shared by the initramfs (/sbin) and the
+# rootfs (/usr/sbin).
+#
+#   usb-gadget start         create the gadget and bind it to the UDC; the
+#                            LUN starts with no medium
+#   usb-gadget storage on    unmount /data and hand the partition to the host
+#   usb-gadget storage off   take it back and remount /data; refuses while
+#                            the host still holds the medium (its writes
+#                            would be lost), unless given --force
+#   usb-gadget status
+#
+# Mass storage exports the raw block device, so /data cannot stay mounted
+# while the host has it: "storage on" fails if anything (RetroArch) still
+# has it open. A host eject closes the LUN; a watcher then remounts /data.
+
+G=/sys/kernel/config/usb_gadget/miroki
+MS=$G/functions/mass_storage.0
+LUN=$MS/lun.0
+
+log() {
+    echo "usb-gadget: $*" > /dev/kmsg
+    [ -t 2 ] && echo "usb-gadget: $*" >&2
+}
+
+# /dev node of the eMMC partition named $1 (same as init's and rcS's).
+find_part() {
+    for d in /sys/class/block/*; do
+        [ -f "$d/partition" ] || continue
+        grep -qx "PARTNAME=$1" "$d/uevent" || continue
+        disk=$(basename "$(dirname "$(readlink -f "$d")")")
+        [ "$(cat "/sys/class/block/$disk/device/type" 2>/dev/null)" = MMC ] || continue
+        echo "/dev/${d##*/}"
+        return 0
+    done
+    return 1
+}
+
+start() {
+    mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config
+    if [ ! -d "$G" ]; then
+        mkdir -p "$G"
+        echo 0x1d6b > "$G/idVendor"      # Linux Foundation
+        echo 0x0104 > "$G/idProduct"     # multifunction composite
+        echo 0x0100 > "$G/bcdDevice"
+        echo 0x0200 > "$G/bcdUSB"
+        mkdir -p "$G/strings/0x409"
+        echo MIROKI > "$G/strings/0x409/manufacturer"
+        echo "RG Rotate" > "$G/strings/0x409/product"
+        echo 0001 > "$G/strings/0x409/serialnumber"
+
+        mkdir -p "$G/configs/c.1/strings/0x409"
+        echo "serial + storage" > "$G/configs/c.1/strings/0x409/configuration"
+        echo 500 > "$G/configs/c.1/MaxPower"
+
+        mkdir -p "$G/functions/acm.GS0"
+        mkdir -p "$MS"
+        echo 1 > "$LUN/removable"
+        echo "MIROKI data" > "$LUN/inquiry_string" 2> /dev/null
+        ln -s "$G/functions/acm.GS0" "$G/configs/c.1/"
+        ln -s "$MS" "$G/configs/c.1/"
+    fi
+
+    # The UDC (musb) may still be probing.
+    i=0
+    while ! udc=$(ls /sys/class/udc 2>/dev/null | head -n 1) || [ -z "$udc" ]; do
+        i=$((i + 1))
+        [ $i -lt 100 ] || { log "no UDC after 10 s"; return 1; }
+        sleep 0.1
+    done
+    [ "$(cat "$G/UDC")" = "$udc" ] || echo "$udc" > "$G/UDC"
+    log "bound to $udc"
+}
+
+remount_data() {
+    mountpoint -q /data && return 0
+    dev=$(find_part data) || { log "no data partition"; return 1; }
+    if mount -t exfat -o noatime "$dev" /data; then
+        log "data remounted"
+    else
+        log "data remount failed; fsck.exfat -y $dev may help"
+        return 1
+    fi
+}
+
+# Remount /data once the host lets go of the LUN (eject or "storage off").
+watch_eject() {
+    while [ -n "$(cat "$LUN/file" 2>/dev/null)" ]; do
+        sleep 1
+    done
+    remount_data
+}
+
+storage_on() {
+    [ -d "$MS" ] || { log "gadget not started"; return 1; }
+    [ -n "$(cat "$LUN/file")" ] && { log "already exported"; return 0; }
+    dev=$(find_part data) || { log "no data partition"; return 1; }
+    if mountpoint -q /data; then
+        sync
+        umount /data || { log "/data is busy (RetroArch?), not exporting"; return 1; }
+    fi
+    echo "$dev" > "$LUN/file" || { log "could not attach $dev"; remount_data; return 1; }
+    log "$dev exported to the host; eject it there, or run 'usb-gadget storage off'"
+    watch_eject > /dev/null 2>&1 &
+}
+
+storage_off() {
+    [ -n "$(cat "$LUN/file" 2>/dev/null)" ] || { remount_data; return $?; }
+    # Clearing the file fails with EBUSY while the host has the medium
+    # locked (PREVENT_MEDIUM_REMOVAL, i.e. still mounted): anything in its
+    # write cache would be lost, so stop there unless forced.
+    if ! echo "" > "$LUN/file" 2> /dev/null; then
+        if [ "$1" = --force ] && [ -f "$LUN/forced_eject" ]; then
+            echo 1 > "$LUN/forced_eject"
+            log "forced eject: unflushed host writes are gone"
+        else
+            log "the host still holds the medium: eject it there first (or --force)"
+            return 1
+        fi
+    fi
+    log "export withdrawn"
+    # The watcher remounts; wait for it so the caller can rely on /data.
+    i=0
+    while ! mountpoint -q /data && [ $i -lt 50 ]; do i=$((i + 1)); sleep 0.1; done
+    remount_data
+}
+
+status() {
+    if [ -d "$G" ]; then
+        echo "gadget: bound to '$(cat "$G/UDC")'"
+        f=$(cat "$LUN/file" 2>/dev/null)
+        echo "storage: ${f:-not exported}"
+    else
+        echo "gadget: not created"
+    fi
+    mountpoint -q /data && echo "/data: mounted" || echo "/data: not mounted"
+}
+
+case "$1" in
+    start)   start ;;
+    storage)
+        case "$2" in
+            on)  storage_on ;;
+            off) storage_off "$3" ;;
+            *)   echo "usage: usb-gadget storage on|off" >&2; exit 2 ;;
+        esac ;;
+    status)  status ;;
+    *)       echo "usage: usb-gadget start | storage on|off | status" >&2; exit 2 ;;
+esac

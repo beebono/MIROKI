@@ -48,5 +48,6 @@ ln -sf bin/busybox "$ROOT_DIR/linuxrc"
 
 cp "$SRC_DIR/init" "$ROOT_DIR/init"
 chmod +x "$ROOT_DIR/init"
+install -m 0755 "$SRC_DIR/usb-gadget" "$ROOT_DIR/sbin/usb-gadget"
 
 echo "Built: $ROOT_DIR"

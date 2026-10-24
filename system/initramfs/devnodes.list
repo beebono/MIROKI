@@ -1,0 +1,6 @@
+# Device nodes for the cfw initramfs (gen_init_cpio format), added to the
+# directory by tools/build_cfw_boot.sh via CONFIG_INITRAMFS_SOURCE.
+# They have to exist before /init runs: the kernel opens /dev/console for
+# init's stdio, and init logs into /dev/kmsg before devtmpfs is mounted.
+nod /dev/console 0600 0 0 c 5 1
+nod /dev/kmsg 0644 0 0 c 1 11

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  eMMC user-area layout for the cfw boot (SPL straight to Linux, no u-boot),
+  for `spd_dump ... repartition <this file>`. Sizes are in MB; 0xFFFFFFFF
+  takes the rest of the device. The SPL lives in the eMMC hardware boot
+  partitions (splloader / splloader_bak), not here.
+
+  prodnv / miscdata: factory calibration + flags. Unused by the cfw boot,
+  kept so the stock FDL2 and a later restore to Android still find them.
+  uboot_log: SPL diagnostic dumps (ramoops, old printk buffer).
+  boot: raw, no filesystem, packed by mk_cfw_boot.py: arm64
+  Image (initramfs built in) at offset 0, dtb at offset 48 MiB.
+-->
+<Partitions>
+	<Partition id="prodnv" size="10"/>
+	<Partition id="miscdata" size="1"/>
+	<Partition id="uboot_log" size="4"/>
+	<Partition id="boot" size="64"/>
+	<Partition id="rootfs" size="2048"/>
+	<Partition id="data" size="0xFFFFFFFF"/>
+</Partitions>

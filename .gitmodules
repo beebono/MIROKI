@@ -1,0 +1,27 @@
+[submodule "ext/boot/linux"]
+	path = ext/boot/linux
+	url = https://github.com/beebono/linux-mainline-sprd.git
+	branch = emmc-cfw
+[submodule "ext/boot/spl"]
+	path = ext/boot/spl
+	url = https://github.com/beebono/ums512_spl.git
+	branch = emmc-cfw
+[submodule "ext/retroarch/launcher"]
+	path = ext/retroarch/launcher
+	url = https://github.com/libretro/RetroArch.git
+[submodule "ext/retroarch/mupen64pow2"]
+	path = ext/retroarch/mupen64pow2
+	url = https://github.com/beebono/mupen64pow2-libretro.git
+[submodule "ext/retroarch/pcsx-rearmed"]
+	path = ext/retroarch/pcsx-rearmed
+	url = https://github.com/notaz/pcsx_rearmed.git
+[submodule "ext/retroarch/yabadabadoo"]
+	path = ext/retroarch/yabadabadoo
+	url = https://github.com/ProRapSuperstarOriginalMaster/Yabadabadoo.git
+[submodule "ext/system/busybox"]
+	path = ext/system/busybox
+	url = https://github.com/mirror/busybox.git
+[submodule "ext/system/mali-kbase"]
+	path = ext/system/mali-kbase
+	url = https://github.com/beebono/mali_kbase
+	branch = ums512

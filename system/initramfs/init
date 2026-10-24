@@ -1,0 +1,46 @@
+#!/bin/sh
+# CFW bring-up init: no rootfs, just a shell on the USB serial gadget.
+# Kernel messages reach the panel through console=tty0 and USB through
+# console=ttyGS0 (bootargs in ums512-rg-rotate-cfw.dts); this script's own
+# messages go to both as well.
+
+export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+
+log() {
+    echo "cfw: $*" > /dev/kmsg
+}
+
+log "initramfs up, kernel $(uname -r)"
+
+# g_serial is built in; ttyGS0 appears once the UDC binds.
+i=0
+while [ ! -e /dev/ttyGS0 ]; do
+    i=$((i + 1))
+    if [ $i -eq 300 ]; then
+        # No gadget after 30s. Record why, then exit: init dying panics the
+        # kernel, the running watchdog resets with DRAM kept, and the SPL
+        # saves the ramoops console to uboot_log.
+        mount -t debugfs debugfs /sys/kernel/debug
+        log "no /dev/ttyGS0 after 30s; udc: $(ls /sys/class/udc 2>&1 | tr '\n' ' ')"
+        while read -r line; do
+            log "deferred: $line"
+        done < /sys/kernel/debug/devices_deferred
+        log "exiting init to panic into a DRAM-keeping reset"
+        sleep 1
+        exit 1
+    fi
+    sleep 0.1
+done
+log "ttyGS0 ready, shell on USB serial"
+
+# USB: respawn so a host disconnect does not leave the gadget dead.
+while true; do
+    setsid getty -n -l /bin/sh 115200 ttyGS0 vt100
+    sleep 1
+done

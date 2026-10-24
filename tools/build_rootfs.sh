@@ -69,8 +69,10 @@ rsync -a --exclude=.git "$UDEV0_SRC/" "$UDEV0_BUILD/"
 make -C "$UDEV0_BUILD" -j"$JOBS" CC="${CROSS_COMPILE}gcc" CFLAGS=-O2 \
 	LDFLAGS="-Wl,--version-script=libudev.sym" libudev.so.1
 
-# --- input aggregator ---
+# --- input aggregator, tmix for the audio routing, tone for testing it ---
 make -C "$AGG_DIR" O="$OUT_DIR/aggregator" CROSS_COMPILE="$CROSS_COMPILE"
+make -C "$REPO_ROOT/system/tmix" O="$OUT_DIR/tmix" CROSS_COMPILE="$CROSS_COMPILE"
+make -C "$REPO_ROOT/system/tone" O="$OUT_DIR/tone" CROSS_COMPILE="$CROSS_COMPILE"
 
 # --- busybox ---
 cp "$BUSYBOX_CONFIG" "$BUSYBOX_DIR/.config"
@@ -121,6 +123,8 @@ rsync -a --exclude=ucm --exclude=ucm2 /usr/share/alsa/ "$ROOT_DIR/usr/share/alsa
 install -m 0755 "$UDEV0_BUILD/libudev.so.1" "$ROOT_DIR/usr/lib/libudev.so.1"
 "${CROSS_COMPILE}strip" --strip-unneeded "$ROOT_DIR/usr/lib/libudev.so.1"
 install -m 0755 "$OUT_DIR/aggregator/miroki-inputd" "$ROOT_DIR/usr/bin/miroki-inputd"
+install -m 0755 "$OUT_DIR/tmix/tmix" "$ROOT_DIR/usr/bin/tmix"
+install -m 0755 "$OUT_DIR/tone/tone" "$ROOT_DIR/usr/bin/tone"
 
 # --- RetroArch ---
 install -m 0755 "$RETROARCH" "$ROOT_DIR/usr/bin/retroarch"

@@ -1,6 +1,7 @@
 #!/bin/sh
-# MIROKI system init (busybox init sysinit): modules, scratch mounts, and the
-# exFAT data partition. Logs to /dev/kmsg, so it shows up in dmesg.
+# MIROKI system init (busybox init sysinit): modules, scratch mounts, the
+# exFAT data partition and the audio routing. Logs to /dev/kmsg, so it shows
+# up in dmesg.
 
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -58,3 +59,42 @@ mount_data() {
     log "data $dev mounted on /data"
 }
 mount_data
+
+# Audio routing, from ROCKNIX's sprdphone-sc2730 UCM BootSequence by way of
+# old MIROKI. The speaker is the codec's HP path into the external AW87390
+# amp, not the SPK pin. No "DSP VBC Profile Select": the driver only keeps a
+# selection that indexes a profile loaded through "DSP VBC Profile Update"
+# (the dsp_vbc firmware stock loads from /vendor/firmware), so without that
+# blob it is a no-op and the DSP runs untuned.
+mix() {
+    tmix "$@" > /dev/null 2> /dev/kmsg || log "tmix '$1' failed"
+}
+audio_init() {
+    i=0
+    while [ ! -e /dev/snd/controlC0 ]; do
+        i=$((i + 1))
+        [ $i -eq 100 ] && { log "no sound card after 10s"; return 1; }
+        sleep 0.1
+    done
+    mix 'HP mix mode' 0
+    mix 'HPL EAR Sel' HPL
+    mix 'VBC DAC0 DG Set' 63,63
+    mix 'HPL Gain HPL Playback Volume' 8
+    mix 'HPR Gain HPR Playback Volume' 8
+    mix 'VBC_MIXER0_DAC0' HALF_ADD
+    mix 'DAC LRCLK Select' invert
+    mix 'agdsp_access_en' on
+    mix 'S_NORMAL_AP01_P_CODEC SWITCH' on
+    mix 'VBC_DAC0_DP_EN' enable
+    mix 'HPL Mixer DACLHPL Switch' on
+    mix 'HPR Mixer DACRHPR Switch' on
+    mix 'Speaker Function' on
+    mix 'Speaker1 Function' on
+    mix 'VBC DAC0 AUD MDG Set' 1,1024
+
+    # Softvol's control (/etc/asound.conf) only exists once the default PCM
+    # has been opened: open it, then set the starting level (of 0..15).
+    tone 0 2> /dev/kmsg || log "opening the default PCM failed"
+    mix 'MIROKI Playback Volume' 6
+}
+audio_init

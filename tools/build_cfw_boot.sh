@@ -7,7 +7,8 @@
 #
 # The initramfs comes from system/initramfs/build-initramfs.sh (busybox, the
 # firmware, and the bring-up init: a shell on the USB serial gadget, no
-# rootfs).
+# rootfs). The partition also carries the EL3 monitor (ext/boot/spl/monitor),
+# which gives Linux PSCI.
 #
 # Output: build/cfw/boot.img. Flash it to the eMMC "boot" partition with
 # spd_dump; the partition layout is tools/cfw-emmc-partitions.xml.
@@ -51,11 +52,16 @@ make -j"$JOBS" Image
 make -j"$JOBS" "sprd/$DTB_NAME.dtb"
 cd "$REPO_ROOT"
 
+# --- EL3 monitor ---
+make -C "$REPO_ROOT/ext/boot/spl/monitor" O="$OUT_DIR/monitor" \
+	CROSS_COMPILE="$CROSS_COMPILE"
+
 # --- pack the raw boot partition ---
 python3 "$REPO_ROOT/ext/boot/spl/scripts/mk_cfw_boot.py" \
 	"$KERNEL_DIR/arch/arm64/boot/Image" \
 	"$KERNEL_DIR/arch/arm64/boot/dts/sprd/$DTB_NAME.dtb" \
-	"$OUT_DIR/boot.img"
+	"$OUT_DIR/boot.img" \
+	"$OUT_DIR/monitor/monitor.bin"
 
 echo "Built: $OUT_DIR/boot.img"
 echo "Flash it to the eMMC \"boot\" partition, with the cfw SPL in splloader."

@@ -1,0 +1,10 @@
+# MIROKI busybox init. The initramfs switch_roots here with /dev, /proc and
+# /sys already mounted.
+::sysinit:/etc/init.d/rcS
+
+# Debug shell on the USB serial gadget (ttyACM0 on the host).
+ttyGS0::respawn:/sbin/getty -n -l /bin/sh 115200 ttyGS0 vt100
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/sync
+::shutdown:/bin/umount -a -r

@@ -1,46 +1,95 @@
 #!/bin/sh
-# CFW bring-up init: no rootfs, just a shell on the USB serial gadget.
-# Kernel messages reach the panel through console=tty0 and USB through
-# console=ttyGS0 (bootargs in ums512-rg-rotate-cfw.dts); this script's own
-# messages go to both as well.
+# MIROKI initramfs init: find the "rootfs" partition on the eMMC, mount its
+# squashfs and switch_root into it. Without a usable rootfs, fall back to the
+# bring-up shell on the USB serial gadget.
+#
+# This script logs to /dev/kmsg, so its messages land in dmesg and on the
+# panel console (console=tty0), timestamped.
 
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
-mkdir -p /dev/pts
-mount -t devpts devpts /dev/pts
 
 log() {
     echo "cfw: $*" > /dev/kmsg
 }
 
+# /dev node of the eMMC partition named $1 (GPT PARTLABEL), if present. Only
+# the eMMC counts ("MMC", not "SD"), so an SD card with a partition of the
+# same name cannot take over the boot.
+find_part() {
+    for d in /sys/class/block/*; do
+        [ -f "$d/partition" ] || continue
+        grep -qx "PARTNAME=$1" "$d/uevent" || continue
+        disk=$(basename "$(dirname "$(readlink -f "$d")")")
+        [ "$(cat "/sys/class/block/$disk/device/type" 2>/dev/null)" = MMC ] || continue
+        echo "/dev/${d##*/}"
+        return 0
+    done
+    return 1
+}
+
+# The bring-up shell: what this init used to be, kept for when the rootfs is
+# missing or broken.
+fallback_shell() {
+    mkdir -p /dev/pts
+    mount -t devpts devpts /dev/pts
+
+    # g_serial is built in; ttyGS0 appears once the UDC binds.
+    i=0
+    while [ ! -e /dev/ttyGS0 ]; do
+        i=$((i + 1))
+        if [ $i -eq 300 ]; then
+            # No gadget after 30s. Record why, then exit: init dying panics
+            # the kernel, the running watchdog resets with DRAM kept, and the
+            # SPL saves the ramoops console to uboot_log.
+            mount -t debugfs debugfs /sys/kernel/debug
+            log "no /dev/ttyGS0 after 30s; udc: $(ls /sys/class/udc 2>&1 | tr '\n' ' ')"
+            while read -r line; do
+                log "deferred: $line"
+            done < /sys/kernel/debug/devices_deferred
+            log "exiting init to panic into a DRAM-keeping reset"
+            sleep 1
+            exit 1
+        fi
+        sleep 0.1
+    done
+    log "ttyGS0 ready, fallback shell on USB serial"
+
+    # Respawn so a host disconnect does not leave the gadget dead.
+    while true; do
+        setsid getty -n -l /bin/sh 115200 ttyGS0 vt100
+        sleep 1
+    done
+}
+
 log "initramfs up, kernel $(uname -r)"
 
-# g_serial is built in; ttyGS0 appears once the UDC binds.
+# The eMMC is normally up well before init runs; allow it a few seconds.
 i=0
-while [ ! -e /dev/ttyGS0 ]; do
+while ! root=$(find_part rootfs); do
     i=$((i + 1))
-    if [ $i -eq 300 ]; then
-        # No gadget after 30s. Record why, then exit: init dying panics the
-        # kernel, the running watchdog resets with DRAM kept, and the SPL
-        # saves the ramoops console to uboot_log.
-        mount -t debugfs debugfs /sys/kernel/debug
-        log "no /dev/ttyGS0 after 30s; udc: $(ls /sys/class/udc 2>&1 | tr '\n' ' ')"
-        while read -r line; do
-            log "deferred: $line"
-        done < /sys/kernel/debug/devices_deferred
-        log "exiting init to panic into a DRAM-keeping reset"
-        sleep 1
-        exit 1
+    if [ $i -eq 50 ]; then
+        log "no rootfs partition on the eMMC"
+        fallback_shell
     fi
     sleep 0.1
 done
-log "ttyGS0 ready, shell on USB serial"
 
-# USB: respawn so a host disconnect does not leave the gadget dead.
-while true; do
-    setsid getty -n -l /bin/sh 115200 ttyGS0 vt100
-    sleep 1
-done
+if ! mount -t squashfs -o ro "$root" /newroot; then
+    log "$root: not a mountable squashfs"
+    fallback_shell
+fi
+if [ ! -x /newroot/sbin/init ]; then
+    log "$root: no /sbin/init"
+    umount /newroot
+    fallback_shell
+fi
+
+log "rootfs $root, switching root"
+mount --move /dev /newroot/dev
+mount --move /proc /newroot/proc
+mount --move /sys /newroot/sys
+exec switch_root /newroot /sbin/init

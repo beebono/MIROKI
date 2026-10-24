@@ -1,0 +1,59 @@
+#!/bin/sh
+# MIROKI system init (busybox init sysinit): modules, scratch mounts, and the
+# exFAT data partition. Logs to /dev/kmsg, so it shows up in dmesg.
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+log() {
+    echo "miroki: $*" > /dev/kmsg
+}
+
+mountpoint -q /proc || mount -t proc proc /proc
+mountpoint -q /sys || mount -t sysfs sysfs /sys
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+
+# Modules first. The audio nodes take their power domain from
+# sprd-audcp-boot (it boots the DSP with /lib/firmware/agdsp.bin) and stop
+# waiting for it when the deferred probe timeout (10 s after late_initcall)
+# runs out.
+for m in sprd-audcp-boot mali_kbase; do
+    modprobe "$m" || log "modprobe $m failed"
+done
+
+# /dev node of the eMMC partition named $1 (same as the initramfs's).
+find_part() {
+    for d in /sys/class/block/*; do
+        [ -f "$d/partition" ] || continue
+        grep -qx "PARTNAME=$1" "$d/uevent" || continue
+        disk=$(basename "$(dirname "$(readlink -f "$d")")")
+        [ "$(cat "/sys/class/block/$disk/device/type" 2>/dev/null)" = MMC ] || continue
+        echo "/dev/${d##*/}"
+        return 0
+    done
+    return 1
+}
+
+# Data: ROMs, saves, config. Formatted only when it carries no exFAT
+# signature at all (a first boot); an exFAT volume that fails to mount gets a
+# fsck instead, never a format.
+mount_data() {
+    dev=$(find_part data) || { log "no data partition on the eMMC"; return 1; }
+    # An unreadable device also shows no signature: never format on that.
+    dd if="$dev" of=/dev/null bs=64k count=16 2>/dev/null || { log "$dev unreadable"; return 1; }
+    type=$(blkid "$dev" | sed -n 's/.* TYPE="\([^"]*\)".*/\1/p')
+    if [ "$type" != exfat ]; then
+        log "$dev holds ${type:-no filesystem}, formatting it exFAT"
+        mkfs.exfat -L MIROKI "$dev" > /dev/kmsg 2>&1 || { log "mkfs.exfat failed"; return 1; }
+    fi
+    if ! mount -t exfat -o noatime "$dev" /data; then
+        log "$dev: exFAT mount failed, running fsck.exfat"
+        fsck.exfat -y "$dev" > /dev/kmsg 2>&1
+        mount -t exfat -o noatime "$dev" /data || { log "$dev: still not mountable"; return 1; }
+    fi
+    log "data $dev mounted on /data"
+}
+mount_data

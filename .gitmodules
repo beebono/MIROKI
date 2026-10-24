@@ -25,3 +25,6 @@
 	path = ext/system/mali-kbase
 	url = https://github.com/beebono/mali_kbase
 	branch = ums512
+[submodule "ext/system/exfatprogs"]
+	path = ext/system/exfatprogs
+	url = https://github.com/exfatprogs/exfatprogs.git

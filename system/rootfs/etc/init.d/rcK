@@ -1,0 +1,14 @@
+#!/bin/sh
+# MIROKI shutdown (busybox init, on reboot/poweroff, before the filesystems
+# are remounted read-only): save state that rcS restores on the next boot.
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Playback level, from softvol's control ("'MIROKI Playback Volume' = 12 12 ...")
+if mountpoint -q /data; then
+    level=$(tmix 'MIROKI Playback Volume' 2> /dev/null | sed -n 's/^[^=]*= \([0-9]*\).*/\1/p')
+    if [ -n "$level" ]; then
+        mkdir -p /data/.config
+        echo "$level" > /data/.config/audio_level
+    fi
+fi

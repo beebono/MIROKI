@@ -89,7 +89,7 @@ rm -f "$ROOT_DIR/linuxrc"
 mkdir -p "$ROOT_DIR"/{dev,proc,sys,run,tmp,data,etc,lib/firmware}
 
 cp -a "$SKEL_DIR/." "$ROOT_DIR/"
-chmod +x "$ROOT_DIR/etc/init.d/rcS"
+chmod +x "$ROOT_DIR/etc/init.d/rcS" "$ROOT_DIR/etc/init.d/rcK"
 cp -a "$MOD_DIR/lib/modules" "$ROOT_DIR/lib/"
 cp -a "$FIRMWARE_DIR/." "$ROOT_DIR/lib/firmware/"
 for t in mkfs.exfat fsck.exfat; do

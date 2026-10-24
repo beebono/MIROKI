@@ -93,8 +93,14 @@ audio_init() {
     mix 'VBC DAC0 AUD MDG Set' 1,1024
 
     # Softvol's control (/etc/asound.conf) only exists once the default PCM
-    # has been opened: open it, then set the starting level (of 0..15).
+    # has been opened: open it, then restore the level (0..15) rcK saved.
     tone 0 2> /dev/kmsg || log "opening the default PCM failed"
-    mix 'MIROKI Playback Volume' 6
+    level=6
+    [ -r /data/.config/audio_level ] && read -r level < /data/.config/audio_level
+    case "$level" in
+    ''|*[!0-9]*) level=6 ;;
+    esac
+    [ "$level" -gt 15 ] && level=15
+    mix 'MIROKI Playback Volume' "$level"
 }
 audio_init

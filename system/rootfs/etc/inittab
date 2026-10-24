@@ -9,5 +9,6 @@
 ttyGS0::respawn:/sbin/getty -n -l /bin/sh 115200 ttyGS0 vt100
 
 ::ctrlaltdel:/sbin/reboot
+::shutdown:/etc/init.d/rcK
 ::shutdown:/bin/sync
 ::shutdown:/bin/umount -a -r

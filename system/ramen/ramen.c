@@ -1014,8 +1014,14 @@ static void ramen_read_status(ramen_handle_t *rm)
       rm->bat_pct = MAX(0, MIN(100, atoi(buf)));
    else
       rm->bat_pct = -1;
-   rm->bat_charging = ramen_read_line(RAMEN_CHARGER_PATH "/status", buf, sizeof(buf))
-      && string_is_equal(buf, "Charging");
+   rm->bat_charging = false;
+   if (ramen_read_line(RAMEN_CHARGER_PATH "/status", buf, sizeof(buf)))
+   {
+      rm->bat_charging = string_is_equal(buf, "Charging");
+      /* the charger has terminated: full, whatever the gauge thinks */
+      if (string_is_equal(buf, "Full"))
+         rm->bat_pct = 100;
+   }
    if (ramen_read_line(RAMEN_VOLUME_PATH, buf, sizeof(buf)))
       rm->vol = MAX(0, MIN(RAMEN_VOLUME_MAX, atoi(buf)));
 }

@@ -217,6 +217,23 @@ enum ramen_sound
  * eject (or Start again) takes it back; /data is polled this often. */
 #define RAMEN_USB_POLL_S  0.5f
 
+/* Battery and volume, as two glass vials with metal caps: stacked in the
+ * carousel's top left, side by side along the bottom of the in-game menu.
+ * The level comes from the fuel gauge, charging from the charger, the
+ * volume from the level miroki-inputd keeps on data (0-15). All are polled
+ * only while the vials are up. Sizes are fractions of S: the glass's
+ * half-width and half-height, and a cap's half-height. */
+#define RAMEN_FGU_PATH      "/sys/class/power_supply/sc27xx-fgu"
+#define RAMEN_CHARGER_PATH  "/sys/class/power_supply/aw32257-0"
+#define RAMEN_VOLUME_PATH   "/data/.config/audio_level"
+#define RAMEN_VOLUME_MAX    15
+#define RAMEN_STATUS_POLL_S 0.25f
+#define RAMEN_HUD_S         0.20f
+#define RAMEN_VIAL_HW       0.030f
+#define RAMEN_VIAL_HH       0.070f
+#define RAMEN_VIAL_CAP      0.014f
+#define RAMEN_HUD_TEXT      0.84f
+
 /* Pivot corner in screen space (origin top-left, y down): the design is
  * written for the open orientation, pivot at the bottom-right. Switch these
  * if the panel comes up with the hinge elsewhere. */
@@ -303,6 +320,16 @@ typedef struct ramen_handle
    char  notice[128];
    float notice_t;
 
+   /* The vials: battery percent (-1 unknown) and whether it is charging,
+    * the volume level (-1 unknown), the poll countdown, their visibility
+    * 0..1, and a clock for the bubbles. */
+   int   bat_pct;
+   bool  bat_charging;
+   int   vol;
+   float status_poll;
+   float hud;
+   float clock;
+
    /* The game view: one list per system, loaded on first entry; the
     * game wheel is the capsule queue's rotation, same spring as the big
     * one. */
@@ -364,6 +391,12 @@ typedef struct ramen_handle
    GLint u_ig;
    GLint u_ig_open;
    GLint u_degauss;
+   GLint u_vial;
+   GLint u_vial_rgb;
+   GLint u_vial_dim;
+   GLint u_hud;
+   GLint u_phosphor;
+   GLint u_time;
 
    font_data_t *font;
    float font_size;
@@ -414,11 +447,81 @@ static const char *ramen_frag =
    "uniform float u_ig;\n"
    "uniform vec2 u_ig_open;\n"
    "uniform float u_degauss;\n"
+   "uniform vec4 u_vial[2];\n"
+   "uniform vec3 u_vial_rgb[2];\n"
+   "uniform vec3 u_vial_dim;\n"
+   "uniform float u_hud;\n"
+   "uniform float u_phosphor;\n"
+   "uniform float u_time;\n"
    "\n"
    /* signed distance to a rounded rectangle: half-size h, corner radius r */
    "float rrect(vec2 p, vec2 h, float r) {\n"
    "  vec2 q = abs(p) - h + r;\n"
    "  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;\n"
+   "}\n"
+   "\n"
+   /* A vial in screen space: v = centre, liquid level 0..1, bubbles (1 while
+    * charging). The glass is a cylinder seen side on, so its walls brighten
+    * where they are seen edge on; the liquid climbs them in a meniscus. A
+    * short metal cylinder caps either end. cov collects the coverage. */
+   "vec3 vial(vec3 col, vec2 p, vec4 v, vec3 liq, inout float cov) {\n"
+   "  float hw = u_vial_dim.x;\n"
+   "  float hh = u_vial_dim.y;\n"
+   "  float ch = u_vial_dim.z;\n"
+   "  float cw = hw * 1.22;\n"
+   "  vec2 q = p - v.xy;\n"
+   "  if (abs(q.x) > cw + 2.0 || abs(q.y) > hh + 2.0 * ch + 2.0) return col;\n"
+   "  float body = 1.0 - smoothstep(-0.75, 0.75, rrect(q, vec2(hw, hh), hw * 0.3));\n"
+   "  float xn = clamp(q.x / hw, -1.0, 1.0);\n"
+   "  float xz = sqrt(max(0.0, 1.0 - xn * xn));\n"
+   "  vec3 glass = vec3(0.55, 0.70, 0.85);\n"
+   "  vec3 b = mix(col, glass * 0.30, 0.25);\n"
+   "  float top = hh - 2.0 * hh * v.z;\n"
+   "  float men = top - hw * 0.35 * xn * xn;\n"
+   "  float lq = (1.0 - smoothstep(-0.75, 0.75, rrect(q, vec2(hw - 1.5, hh - 1.0), hw * 0.25)))\n"
+   "           * smoothstep(men - 0.75, men + 0.75, q.y) * step(0.001, v.z);\n"
+   "  vec3 lc = liq * (0.50 + 0.50 * xz);\n"
+   "  lc += liq * 0.45 * exp(-abs(q.y - men) / 0.9);\n"
+   "  if (v.w > 0.5) {\n"
+   "    for (int i = 0; i < 3; i++) {\n"
+   "      float fi = float(i);\n"
+   "      float t = fract(u_time * (0.35 + 0.12 * fi) + fi * 0.37);\n"
+   "      vec2 bc = vec2(hw * (-0.45 + 0.45 * fi), mix(hh - 2.0, men + 2.0, t));\n"
+   "      float br = hw * (0.14 + 0.04 * fi);\n"
+   "      float bd = length(q - bc);\n"
+   "      lc = mix(lc, vec3(0.92), (1.0 - smoothstep(br - 0.6, br + 0.6, bd)) * 0.45);\n"
+   "    }\n"
+   "  }\n"
+   "  b = mix(b, lc, lq * 0.92);\n"
+   "  b += glass * (1.0 - xz) * 0.45;\n"
+   "  b += vec3(1.0) * exp(-pow((xn + 0.45) / 0.14, 2.0)) * 0.30;\n"
+   "  col = mix(col, b, body);\n"
+   "  cov = max(cov, body);\n"
+   "  for (int k = 0; k < 2; k++) {\n"
+   "    vec2 cq = q - vec2(0.0, (k == 0 ? -1.0 : 1.0) * (hh + ch * 0.85));\n"
+   "    float cap = 1.0 - smoothstep(-0.75, 0.75, rrect(cq, vec2(cw, ch), ch * 0.35));\n"
+   "    float cx = clamp(cq.x / cw, -1.0, 1.0);\n"
+   "    vec3 m = vec3(0.50, 0.52, 0.55) * (0.30 + 0.55 * sqrt(max(0.0, 1.0 - cx * cx)));\n"
+   "    m += vec3(1.0) * exp(-pow((cx + 0.35) / 0.18, 2.0)) * 0.35;\n"
+   /* a groove round the middle */
+   "    m *= 1.0 - 0.45 * exp(-cq.y * cq.y);\n"
+   "    col = mix(col, m, cap);\n"
+   "    cov = max(cov, cap);\n"
+   "  }\n"
+   "  return col;\n"
+   "}\n"
+   "\n"
+   /* both vials, faded by u_hud; on the in-game menu they glow in the
+    * phosphor's green like the rest of the page */
+   "vec3 hud(vec3 col, vec2 p) {\n"
+   "  if (u_hud <= 0.0) return col;\n"
+   "  float cov = 0.0;\n"
+   "  vec3 v = vial(col, p, u_vial[0], u_vial_rgb[0], cov);\n"
+   "  v = vial(v, p, u_vial[1], u_vial_rgb[1], cov);\n"
+   "  float lum = dot(v, vec3(0.299, 0.587, 0.114));\n"
+   "  vec3 ph = vec3(0.012, 0.060, 0.032) + lum * vec3(0.55, 1.0, 0.70) * 1.3;\n"
+   "  v = mix(v, ph, u_phosphor * cov);\n"
+   "  return mix(col, v, u_hud);\n"
    "}\n"
    "\n"
    "void main() {\n"
@@ -460,6 +563,7 @@ static const char *ramen_frag =
    "    float line = exp(-abs(v_px.y - u_size.y * 0.5) / 2.5) * step(abs(c.x), hx) * (1.0 - vy);\n"
    "    float dot_ = exp(-length(v_px - u_size * 0.5) / (3.0 + 30.0 * hx)) * (1.0 - vy) * (1.0 - hx);\n"
    "    col += glow * (line * 1.2 + dot_ * 1.5) * step(0.001, hx);\n"
+   "    col = hud(col, v_px);\n"
    "    frag = vec4(col * u_fade, 1.0);\n"
    "    return;\n"
    "  }\n"
@@ -566,6 +670,7 @@ static const char *ramen_frag =
    "  col = mix(col, glass, body * 0.06);\n"
    "  col += glass * rim * 0.35;\n"
    "  col += vec3(1.0) * spec * 0.25 * body;\n"
+   "  col = hud(col, v_px);\n"
    "\n"
    "  frag = vec4(col * u_fade, 1.0);\n"
    "}\n";
@@ -636,6 +741,12 @@ static bool ramen_gl_init(ramen_handle_t *rm)
    rm->u_ig       = glGetUniformLocation(rm->prog, "u_ig");
    rm->u_ig_open  = glGetUniformLocation(rm->prog, "u_ig_open");
    rm->u_degauss  = glGetUniformLocation(rm->prog, "u_degauss");
+   rm->u_vial     = glGetUniformLocation(rm->prog, "u_vial");
+   rm->u_vial_rgb = glGetUniformLocation(rm->prog, "u_vial_rgb");
+   rm->u_vial_dim = glGetUniformLocation(rm->prog, "u_vial_dim");
+   rm->u_hud      = glGetUniformLocation(rm->prog, "u_hud");
+   rm->u_phosphor = glGetUniformLocation(rm->prog, "u_phosphor");
+   rm->u_time     = glGetUniformLocation(rm->prog, "u_time");
 
    /* the box art array, empty until the game view asks for it */
    glGenTextures(1, &rm->art_tex);
@@ -861,6 +972,41 @@ static void ramen_snd_play(enum ramen_sound which)
    if (audio_driver_mixer_get_stream_state(which) == AUDIO_STREAM_STATE_NONE)
       ramen_snd_load();
    audio_driver_mixer_play_stream(which);
+}
+
+/* ---- battery and volume ------------------------------------------------ */
+
+/* The first line of a small file, or false if it can't be read. */
+static bool ramen_read_line(const char *path, char *buf, size_t len)
+{
+   FILE *f = fopen(path, "r");
+   bool ok = false;
+
+   if (!f)
+      return false;
+   if (fgets(buf, (int)len, f))
+   {
+      buf[strcspn(buf, "\n")] = '\0';
+      ok = true;
+   }
+   fclose(f);
+   return ok;
+}
+
+/* While data is lent to the host (or unreadable) the volume keeps its last
+ * value. */
+static void ramen_read_status(ramen_handle_t *rm)
+{
+   char buf[32];
+
+   if (ramen_read_line(RAMEN_FGU_PATH "/capacity", buf, sizeof(buf)))
+      rm->bat_pct = MAX(0, MIN(100, atoi(buf)));
+   else
+      rm->bat_pct = -1;
+   rm->bat_charging = ramen_read_line(RAMEN_CHARGER_PATH "/status", buf, sizeof(buf))
+      && string_is_equal(buf, "Charging");
+   if (ramen_read_line(RAMEN_VOLUME_PATH, buf, sizeof(buf)))
+      rm->vol = MAX(0, MIN(RAMEN_VOLUME_MAX, atoi(buf)));
 }
 
 /* ---- USB storage ------------------------------------------------------- */
@@ -1332,6 +1478,14 @@ static void ramen_game_step(ramen_handle_t *rm, int dir)
    ramen_snd_play(SND_TICK);
 }
 
+/* The in-game page is drawn once the raster is open and a degauss has
+ * settled. */
+static bool ramen_ig_page_shown(ramen_handle_t *rm)
+{
+   return rm->state == RAMEN_INGAME && rm->ig_v >= 0.97f && !rm->ig_closing
+      && !(rm->ig_degauss >= 0.0f && rm->ig_degauss < RAMEN_DEGAUSS_SHOW);
+}
+
 static void ramen_update(ramen_handle_t *rm, retro_time_t now)
 {
    float dt;
@@ -1451,6 +1605,29 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
 
    if (rm->notice_t > 0.0f)
       rm->notice_t -= dt;
+
+   /* The vials: up on the carousel and the in-game page, polled while up,
+    * and read afresh each time they come back. They make way for the
+    * carousel's notice and the USB screen, which use the same corner. */
+   rm->clock = fmodf(rm->clock + dt, 1000.0f);
+   if ((rm->state == RAMEN_SYSTEM && rm->notice_t <= 0.0f)
+         || ramen_ig_page_shown(rm))
+   {
+      if (rm->hud <= 0.0f)
+         rm->status_poll = 0.0f;
+      rm->hud = MIN(1.0f, rm->hud + dt / RAMEN_HUD_S);
+   }
+   else
+      rm->hud = MAX(0.0f, rm->hud - dt / RAMEN_HUD_S);
+   if (rm->hud > 0.0f)
+   {
+      rm->status_poll -= dt;
+      if (rm->status_poll <= 0.0f)
+      {
+         rm->status_poll = RAMEN_STATUS_POLL_S;
+         ramen_read_status(rm);
+      }
+   }
 
    /* Exported: once the host ejects, the gadget script remounts /data. */
    if (rm->state == RAMEN_USB)
@@ -1862,6 +2039,8 @@ static void *ramen_init(void **userdata, bool video_is_threaded)
    rm->meta_sys = rm->meta_game = -1;
    rm->ig_degauss = -1.0f;
    rm->ig_h       = 1.0f;
+   rm->bat_pct    = -1;
+   rm->vol        = -1;
    ramen_begin_boot_spin(rm, ramen_load_last_system());
    return menu;
 }
@@ -1917,6 +2096,39 @@ static void ramen_context_destroy(void *data)
    ramen_gl_free(rm);
 }
 
+/* Where the vials go: their centres and where each one's text starts.
+ * In the carousel the volume vial sits under the battery; on the in-game
+ * page they share the bottom line, the volume clear of the widest battery
+ * text so that it never shifts. Returns the top of the pair. */
+static float ramen_hud_layout(ramen_handle_t *rm, unsigned width,
+      unsigned height, float vx[2], float vy[2], float tx[2], float sc)
+{
+   float S    = (float)MIN(width, height);
+   float half = (RAMEN_VIAL_HH + 1.85f * RAMEN_VIAL_CAP) * S;
+   float cw   = RAMEN_VIAL_HW * S * 1.22f;
+   float gap  = 0.02f * S;
+
+   if (rm->state == RAMEN_INGAME)
+   {
+      float bw = rm->font
+         ? (float)font_driver_get_message_width(rm->font, "100%", 4, sc)
+         : 0.2f * S;
+      vy[0] = vy[1] = height - 0.03f * S - half;
+      vx[0] = width * 0.10f + cw;
+      tx[0] = vx[0] + cw + gap;
+      vx[1] = tx[0] + bw + 0.05f * S + cw;
+      tx[1] = vx[1] + cw + gap;
+   }
+   else
+   {
+      vx[0] = vx[1] = 0.05f * S + cw;
+      tx[0] = tx[1] = vx[0] + cw + gap;
+      vy[0] = 0.04f * S + half;
+      vy[1] = vy[0] + 2.0f * half + 0.03f * S;
+   }
+   return vy[0] - half;
+}
+
 static void ramen_frame(void *data, video_frame_info_t *video_info)
 {
    ramen_handle_t *rm   = (ramen_handle_t*)data;
@@ -1938,6 +2150,8 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    float ps[2];          /* the pivot on screen */
    float zoomv;          /* the zoom in effect, dive included */
    bool in_sequence;
+   float hud_vx[2], hud_vy[2], hud_tx[2], hud_top;
+   const float hud_sc = RAMEN_HUD_TEXT;
    int k;
 
    if (!rm || !rm->gl_ready)
@@ -2151,6 +2365,34 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    glUniform1f(rm->u_degauss,
          (rm->ig_degauss >= 0.0f && rm->ig_degauss < RAMEN_DEGAUSS_S)
          ? rm->ig_degauss : -1.0f);
+   hud_top = ramen_hud_layout(rm, width, height, hud_vx, hud_vy, hud_tx, hud_sc);
+   glUniform1f(rm->u_hud, rm->hud);
+   if (rm->hud > 0.0f)
+   {
+      /* the battery green, amber at 20%, red at 10%; the volume blue */
+      float pct      = rm->bat_pct < 0 ? 0.0f : rm->bat_pct / 100.0f;
+      float vial[2][4] = {
+         { hud_vx[0], hud_vy[0], pct, rm->bat_charging ? 1.0f : 0.0f },
+         { hud_vx[1], hud_vy[1], rm->vol < 0 ? 0.0f
+                              : (float)rm->vol / RAMEN_VOLUME_MAX, 0.0f } };
+      float rgb[2][3]  = {
+         { 0.35f, 0.85f, 0.45f },
+         { 0.35f, 0.65f, 1.00f } };
+      if (rm->bat_pct >= 0 && rm->bat_pct <= 10)
+      {
+         rgb[0][0] = 0.95f; rgb[0][1] = 0.25f; rgb[0][2] = 0.20f;
+      }
+      else if (rm->bat_pct >= 0 && rm->bat_pct <= 20)
+      {
+         rgb[0][0] = 1.00f; rgb[0][1] = 0.62f; rgb[0][2] = 0.18f;
+      }
+      glUniform4fv(rm->u_vial, 2, &vial[0][0]);
+      glUniform3fv(rm->u_vial_rgb, 2, &rgb[0][0]);
+      glUniform3f(rm->u_vial_dim, RAMEN_VIAL_HW * S, RAMEN_VIAL_HH * S,
+            RAMEN_VIAL_CAP * S);
+      glUniform1f(rm->u_phosphor, rm->state == RAMEN_INGAME ? 1.0f : 0.0f);
+      glUniform1f(rm->u_time, rm->clock);
+   }
    if (rm->state == RAMEN_INGAME)
    {
       gl2_t *gl = (gl2_t*)video_driver_get_ptr();
@@ -2196,6 +2438,35 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    if (rm->font && rm->fade > 0.0f)
    {
       unsigned alpha = (unsigned)(rm->fade * 255.0f);
+
+      if (rm->hud > 0.0f)
+      {
+         /* beside the vials: the battery in percent, the volume as X
+          * (muted), 1-14 or MAX */
+         unsigned ha  = (unsigned)(rm->hud * alpha);
+         uint32_t hc  = rm->state == RAMEN_INGAME
+            ? COLOR_ABGR(130, 205, 160, 230 * ha / 255)
+            : COLOR_ABGR(190, 205, 220, ha);
+         float lift   = rm->font_size * hud_sc * 0.35f;
+         char bat[16], vol[16];
+
+         if (rm->bat_pct < 0)
+            strlcpy(bat, "--", sizeof(bat));
+         else
+            snprintf(bat, sizeof(bat), "%d%%", rm->bat_pct);
+         if (rm->vol < 0)
+            strlcpy(vol, "--", sizeof(vol));
+         else if (rm->vol == 0)
+            strlcpy(vol, "X", sizeof(vol));
+         else if (rm->vol >= RAMEN_VOLUME_MAX)
+            strlcpy(vol, "MAX", sizeof(vol));
+         else
+            snprintf(vol, sizeof(vol), "%d", rm->vol);
+         gfx_display_draw_text(rm->font, bat, hud_tx[0], hud_vy[0] + lift, width, height,
+               hc, TEXT_ALIGN_LEFT, hud_sc, false, 0.0f, true);
+         gfx_display_draw_text(rm->font, vol, hud_tx[1], hud_vy[1] + lift, width, height,
+               hc, TEXT_ALIGN_LEFT, hud_sc, false, 0.0f, true);
+      }
 
       if (rm->state == RAMEN_SYSTEM && rm->label > 0.0f)
       {
@@ -2245,9 +2516,7 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
          /* The page, once the raster is open and the degauss has settled:
           * a title, then rows with the label left and the value right,
           * scrolled to keep the cursor in view. */
-         bool show = rm->ig_v >= 0.97f && !rm->ig_closing
-            && !(rm->ig_degauss >= 0.0f && rm->ig_degauss < RAMEN_DEGAUSS_SHOW);
-         if (show)
+         if (ramen_ig_page_shown(rm))
          {
             char tbuf[256], label[256], value[256];
             const char *title = ramen_ig_title(rm, tbuf, sizeof(tbuf));
@@ -2258,7 +2527,7 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
             float y    = height * 0.13f;
             int n      = ramen_ig_count(rm);
             int sel    = rm->ig_sel[rm->ig_page];
-            int rows   = (int)((height * 0.88f - (y + lh * 1.6f)) / lh);
+            int rows   = (int)((MIN(height * 0.88f, hud_top - lh * 0.6f) - (y + lh * 1.6f)) / lh);
             int first  = 0, r;
 
             if (rows < 1)

@@ -67,6 +67,18 @@ mount_data() {
     # fresh card shows where things go.
     mkdir -p /data/roms/n64 /data/roms/psx /data/roms/saturn /data/bios \
              /data/playlists /data/saves /data/states
+    seed_config
+}
+
+# MIROKI's core options and remaps, copied into RetroArch's config dir on
+# data wherever a file is missing; one already there is the user's.
+seed_config() {
+    src=/usr/share/miroki/retroarch-config
+    dst=/data/.config/retroarch/config
+    (cd "$src" && find . -type f) | while read -r f; do
+        [ -e "$dst/$f" ] && continue
+        mkdir -p "$dst/${f%/*}" && cp "$src/$f" "$dst/$f" || log "seeding $f failed"
+    done
 }
 mount_data
 

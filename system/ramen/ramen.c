@@ -36,6 +36,7 @@
 #include <lists/dir_list.h>
 #include <lists/string_list.h>
 #include <retro_miscellaneous.h>
+#include <retro_timers.h>
 #include <string/stdstring.h>
 
 #include "../../config.h"
@@ -222,6 +223,14 @@ enum ramen_sound
  * eject (or Start again) takes it back; /data is polled this often. */
 #define RAMEN_USB_POLL_S  0.5f
 
+/* Idle: once nothing is moving and there has been no input for a while,
+ * the menu drops to about 20 fps (each pass stretched to 50 ms, three
+ * vsyncs). Rendering the scene at 60 fps over a still picture cost about
+ * 69 mA of the ~197 mA the device drew at the menu. RetroArch's own input
+ * clock is used, so no press is swallowed on the way out. */
+#define RAMEN_IDLE_AFTER_US  3000000
+#define RAMEN_IDLE_FRAME_US  50000
+
 /* Battery and volume, as two glass vials with metal caps: stacked in the
  * carousel's top left, side by side along the bottom of the in-game menu.
  * The level comes from the fuel gauge, charging from the charger, the
@@ -340,6 +349,9 @@ typedef struct ramen_handle
    float status_poll;
    float hud;
    float clock;
+
+   /* When the last render pass ended, for the idle frame pacing. */
+   retro_time_t idle_mark;
 
    /* The game view: one list per system, loaded on first entry; the
     * game wheel is the capsule queue's rotation, same spring as the big
@@ -2781,6 +2793,32 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    glDisable(GL_BLEND);
 }
 
+/* Nothing on screen is moving: the idle frame rate won't show. */
+static bool ramen_still(ramen_handle_t *rm)
+{
+   bool hud_still = rm->hud <= 0.0f || rm->hud >= 1.0f;
+
+   if (rm->fade < 1.0f || rm->launch > 0.0f || rm->usb_req)
+      return false;
+   switch (rm->state)
+   {
+      case RAMEN_SYSTEM:
+         return rm->settled && !rm->boot_spin && rm->label >= 1.0f
+            && rm->jiggle <= 0.0f && rm->notice_t <= 0.0f && hud_still;
+      case RAMEN_USB:
+         return rm->notice_t <= 0.0f;
+      case RAMEN_GAME:
+         return rm->gsettled && rm->mon >= 1.0f
+            && rm->gintro >= rm->gintro_len;
+      case RAMEN_INGAME:
+         return rm->ig_v >= 1.0f && !rm->ig_closing
+            && !(rm->ig_degauss >= 0.0f && rm->ig_degauss < RAMEN_DEGAUSS_S)
+            && hud_still;
+      default:
+         return false;
+   }
+}
+
 /*
  * Called by the run loop each iteration, outside the video driver's frame.
  * Loading content reinitialises the video driver on the spot, so it must
@@ -2790,9 +2828,20 @@ static void ramen_render(void *data, unsigned width, unsigned height,
       bool is_idle)
 {
    ramen_handle_t *rm = (ramen_handle_t*)data;
+   retro_time_t now;
 
    if (!rm)
       return;
+
+   /* Idle pacing: stretch this pass to RAMEN_IDLE_FRAME_US once the
+    * scene is still and input has been quiet for RAMEN_IDLE_AFTER_US. */
+   now = cpu_features_get_time_usec();
+   if (!is_idle && rm->idle_mark && ramen_still(rm)
+         && now - menu_state_get_ptr()->input_last_time_us > RAMEN_IDLE_AFTER_US
+         && now - rm->idle_mark < RAMEN_IDLE_FRAME_US)
+      retro_sleep((unsigned)((RAMEN_IDLE_FRAME_US - (now - rm->idle_mark)) / 1000));
+   rm->idle_mark = cpu_features_get_time_usec();
+
    if (rm->usb_req)
       ramen_usb_run(rm);
    /* Black, and the core takes over from here. */

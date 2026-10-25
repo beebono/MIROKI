@@ -10,6 +10,10 @@ The boot chain is a rebuilt Unisoc SPL and a small EL3 monitor of our own,
 then a mainline-based kernel and a squashfs root. The stock firmware's
 secure world and u-boot are not used.
 
+### AI Disclaimer
+
+Claude Code was used here, like a bunch.
+
 ## Previews
 
 <table>

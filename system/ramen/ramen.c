@@ -1409,6 +1409,9 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
 
    /* The monitor comes on once the sphere has parked and goes off as
     * the games start falling out. */
+   /* The monitor is out of the picture under the in-game menu: leave it
+    * (and its cues) alone there. */
+   if (rm->state != RAMEN_INGAME)
    {
       float was = rm->mon;
       if (rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING)

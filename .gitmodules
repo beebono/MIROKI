@@ -15,9 +15,10 @@
 [submodule "ext/retroarch/pcsx-rearmed"]
 	path = ext/retroarch/pcsx-rearmed
 	url = https://github.com/notaz/pcsx_rearmed.git
-[submodule "ext/retroarch/yabadabadoo"]
-	path = ext/retroarch/yabadabadoo
-	url = https://github.com/ProRapSuperstarOriginalMaster/Yabadabadoo.git
+[submodule "ext/retroarch/yabasanshiro-pirry"]
+	path = ext/retroarch/yabasanshiro-pirry
+	url = https://github.com/beebono/yabasanshiro-pirry.git
+	branch = emmc-cfw
 [submodule "ext/system/busybox"]
 	path = ext/system/busybox
 	url = https://github.com/mirror/busybox.git

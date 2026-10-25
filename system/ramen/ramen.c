@@ -237,8 +237,8 @@ static const struct
    { "PS1",    "psx",    "pcsx_rearmed_libretro.so",
      "cue|chd|pbp|m3u|img|iso|bin|mdf|toc|cbn|exe",
      { 0.55f, 0.55f, 0.60f } },
-   { "Saturn", "saturn", "yabadabadoo_libretro.so",
-     "cue|chd|iso|mds|ccd|m3u|zip",
+   { "Saturn", "saturn", "yabasanshiro_libretro.so",
+     "cue|chd|iso|mds|ccd",
      { 0.95f, 0.45f, 0.20f } },
 };
 

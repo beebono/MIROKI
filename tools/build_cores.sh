@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # Build the libretro cores for the rootfs: mupen64pow2 (N64), pcsx-rearmed
-# (PS1) and yabadabadoo (Saturn), all in ext/retroarch/. Each builds in its
-# own tree with its libretro Makefile (their .gitignores cover the objects
-# and the .so), cross-compiled with the aarch64 toolchain.
+# (PS1) and yabasanshiro-pirry (Saturn), all in ext/retroarch/. Each builds
+# in its own tree with its libretro Makefile (their .gitignores cover the
+# objects and the .so), cross-compiled with the aarch64 toolchain.
 #
 # The CPU flags ride along in CC/CXX: the Makefiles assign CFLAGS with +=,
 # which a command-line CFLAGS= would clobber.
@@ -23,7 +23,7 @@ RA_DIR="$REPO_ROOT/ext/retroarch"
 OUT_DIR="$REPO_ROOT/build/cfw/cores"
 CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}"
 JOBS="${JOBS:-$(nproc)}"
-CORES="${CORES:-mupen64pow2 pcsx-rearmed yabadabadoo}"
+CORES="${CORES:-mupen64pow2 pcsx-rearmed yabasanshiro-pirry}"
 
 CPUFLAGS="-mcpu=cortex-a75.cortex-a55"
 CC="${CROSS_COMPILE}gcc $CPUFLAGS"
@@ -60,14 +60,13 @@ for core in $CORES; do
 			platform=unix CC="$CC" CXX="$CXX" CC_AS="$CC"
 		install_core "$RA_DIR/pcsx-rearmed/pcsx_rearmed_libretro.so"
 		;;
-	yabadabadoo)
-		# Its Makefile detects aarch64 from the host's uname, which is wrong
-		# when cross-compiling: the only effect that matters is HAVE_SSE, so
-		# turn that off by hand. Software rendering only, no dynarec on
-		# aarch64 (DYNAREC is for 32-bit ARM).
-		make -C "$RA_DIR/yabadabadoo/yabause/src/libretro" -j"$JOBS" \
-			platform=unix HAVE_SSE=0 CC="$CC" CXX="$CXX" CC_AS="$CC"
-		install_core "$RA_DIR/yabadabadoo/yabause/src/libretro/yabadabadoo_libretro.so"
+	yabasanshiro-pirry)
+		# platform=arm64 picks the aarch64 SH-2 dynarec; FORCE_GLES renders
+		# through the GLES 3.1 context the core asks RetroArch for. libchdr
+		# is bundled. The generated Musashi sources are checked in.
+		make -C "$RA_DIR/yabasanshiro-pirry/yabause/src/libretro" -j"$JOBS" \
+			platform=arm64 FORCE_GLES=1 CC="$CC" CXX="$CXX" CC_AS="$CC"
+		install_core "$RA_DIR/yabasanshiro-pirry/yabause/src/libretro/yabasanshiro_libretro.so"
 		;;
 	*)
 		echo "ERROR: unknown core '$core'" >&2; exit 1

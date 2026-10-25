@@ -40,7 +40,6 @@ SKEL_DIR="$REPO_ROOT/system/rootfs"
 BLOBS_DIR="$REPO_ROOT/system/prebuilts/libmali-blobs"
 RETROARCH="$OUT_DIR/retroarch/retroarch"
 CORES_DIR="$OUT_DIR/cores"
-YABA_INFO="$REPO_ROOT/ext/retroarch/yabadabadoo/packaging/onion/RetroArch/.retroarch/cores/yabadabadoo_libretro.info"
 TOOLCHAIN_LIB="/usr/aarch64-linux-gnu/lib"
 MULTIARCH_LIB="/usr/lib/aarch64-linux-gnu"
 CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}"
@@ -136,11 +135,9 @@ install -D -m 0644 -t "$ROOT_DIR/usr/share/miroki/fonts" \
 	"$REPO_ROOT/system/ramen/assets/fonts/Audiowide-Regular.ttf" \
 	"$REPO_ROOT/system/ramen/assets/fonts/OFL.txt"
 
-# --- cores: the .so files, plus the info files RetroArch uses to match
-# content to cores (two are MIROKI's own, in the skeleton; yabadabadoo
-# ships its own) ---
+# --- cores: the .so files (the info files RetroArch uses to match content
+# to cores are MIROKI's own, in the skeleton) ---
 install -D -m 0644 -t "$ROOT_DIR/usr/lib/libretro" "$CORES_DIR"/*_libretro.so
-install -D -m 0644 -t "$ROOT_DIR/usr/share/libretro/info" "$YABA_INFO"
 
 # --- shared library closure: copy every missing DT_NEEDED, toolchain first,
 # then multiarch, until nothing new turns up ---

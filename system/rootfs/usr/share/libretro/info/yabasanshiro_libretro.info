@@ -1,0 +1,34 @@
+# Software Information
+display_name = "Sega - Saturn (YabaSanshiro pirry)"
+authors = "devMiyax|Yabause Team|pirrypirrypirry|andr36oid"
+supported_extensions = "cue|iso|mds|ccd|chd"
+corename = "YabaSanshiro"
+categories = "Emulator"
+license = "GPLv2"
+permissions = ""
+
+# Hardware Information
+manufacturer = "Sega"
+systemname = "Saturn"
+systemid = "sega_saturn"
+
+# Libretro Features
+database = "Sega - Saturn"
+supports_no_game = "false"
+savestate = "true"
+savestate_features = "basic"
+hw_render = "true"
+required_hw_api = "OpenGL ES >= 3.1"
+
+# BIOS / Firmware
+firmware_count = 3
+firmware0_desc = "saturn_bios.bin (Saturn BIOS, any region)"
+firmware0_path = "saturn_bios.bin"
+firmware0_opt = "true"
+firmware1_desc = "sega_101.bin (Saturn BIOS v1.01, Japan)"
+firmware1_path = "sega_101.bin"
+firmware1_opt = "true"
+firmware2_desc = "mpr-17933.bin (Saturn BIOS v1.00, USA/Europe)"
+firmware2_path = "mpr-17933.bin"
+firmware2_opt = "true"
+notes = "(!) One of these BIOS files is required; without one the core refuses to load.|(!) sega_101.bin (md5): 85ec9ca47d8f6807718151cbcca8b964|(!) mpr-17933.bin (md5): 3240872c70984b6cbfda1586cab68dbe"

@@ -54,6 +54,7 @@
 #include "../../core_option_manager.h"
 #include "../../runloop.h"
 #include "../../file_path_special.h"
+#include "../../paths.h"
 #include "../../input/input_driver.h"
 #include "../../input/input_remapping.h"
 
@@ -166,6 +167,10 @@
 #define RAMEN_DEGAUSS_S    0.55f
 #define RAMEN_DEGAUSS_SHOW 0.30f   /* the page appears this far in */
 #define RAMEN_IG_BINDS     (RARCH_FIRST_CUSTOM_BIND + 8)
+/* A selected label that doesn't fit scrolls to its end and back, holding
+ * this long at either end, at this many ems a second. */
+#define RAMEN_IG_SCROLL_HOLD 1.2f
+#define RAMEN_IG_SCROLL_EMS  2.5f
 
 enum ramen_ig_page
 {
@@ -312,6 +317,12 @@ typedef struct ramen_handle
    enum ramen_ig_cmd ig_cmd;
    float ig_degauss;     /* seconds since the page switch, or -1 */
    bool  ig_remaps_dirty;
+   bool  ig_remaps_game;  /* save them for this game alone */
+   /* A label too long for its row scrolls while selected: which row the
+    * clock belongs to, and the clock. */
+   int   ig_scroll_page;
+   int   ig_scroll_row;
+   float ig_scroll_t;
 
    /* Boot spin ticks, USB storage, and a notice line in the carousel. */
    int   boot_slot;
@@ -1647,6 +1658,16 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
 
    if (rm->state == RAMEN_INGAME)
    {
+      /* the scroll starts over whenever the cursor or the page moves */
+      if (rm->ig_scroll_page != (int)rm->ig_page
+            || rm->ig_scroll_row != rm->ig_sel[rm->ig_page])
+      {
+         rm->ig_scroll_page = (int)rm->ig_page;
+         rm->ig_scroll_row  = rm->ig_sel[rm->ig_page];
+         rm->ig_scroll_t    = 0.0f;
+      }
+      else
+         rm->ig_scroll_t += dt;
       if (rm->ig_degauss >= 0.0f)
          rm->ig_degauss += dt;
       if (!rm->ig_closing)
@@ -1743,7 +1764,7 @@ static int ramen_ig_count(ramen_handle_t *rm)
          return n;
       }
       case IG_REMAPS:
-         return RAMEN_IG_BINDS;
+         return 1 + RAMEN_IG_BINDS;   /* the d-pad mode, then the binds */
       default:
          return 0;
    }
@@ -1782,12 +1803,58 @@ static bool ramen_ig_core_has_descs(void)
    return false;
 }
 
+/* The Control Remaps page's first row: what the d-pad drives, the d-pad
+ * itself or one of the analog sticks (full deflection), by remapping its
+ * four directions to the stick's half-axes. The pad has no sticks of its
+ * own, so this is how analog-only inputs get reached. */
+enum
+{
+   IG_DPAD_DPAD = 0,
+   IG_DPAD_LEFT_STICK,
+   IG_DPAD_RIGHT_STICK,
+   IG_DPAD_MODES
+};
+
+static const unsigned ramen_ig_dpad_ids[4] = {
+   RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_ID_JOYPAD_DOWN,
+   RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_RIGHT };
+
+static const unsigned ramen_ig_dpad_targets[IG_DPAD_MODES][4] = {
+   { RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_ID_JOYPAD_DOWN,
+     RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_RIGHT },
+   { RARCH_ANALOG_LEFT_Y_MINUS, RARCH_ANALOG_LEFT_Y_PLUS,
+     RARCH_ANALOG_LEFT_X_MINUS, RARCH_ANALOG_LEFT_X_PLUS },
+   { RARCH_ANALOG_RIGHT_Y_MINUS, RARCH_ANALOG_RIGHT_Y_PLUS,
+     RARCH_ANALOG_RIGHT_X_MINUS, RARCH_ANALOG_RIGHT_X_PLUS } };
+
+/* The mode the d-pad's remaps add up to, or -1 if they were set by hand. */
+static int ramen_ig_dpad_mode(const unsigned *ids)
+{
+   int m, d;
+
+   for (m = 0; m < IG_DPAD_MODES; m++)
+   {
+      for (d = 0; d < 4; d++)
+         if (ids[ramen_ig_dpad_ids[d]] != ramen_ig_dpad_targets[m][d])
+            break;
+      if (d == 4)
+         return m;
+   }
+   return -1;
+}
+
+/* Remaps go where RetroArch will look for them at the next load: the
+ * game's own file (remaps/<core>/<game>.rmp) once the d-pad mode has been
+ * set for it, or whenever that file already exists, since RetroArch then
+ * prefers it; the core's file (remaps/<core>/<core>.rmp) otherwise. */
 static void ramen_ig_save_remaps(ramen_handle_t *rm)
 {
    settings_t *settings = config_get_ptr();
    const char *core     = runloop_state_get_ptr()->system.info.library_name;
+   const char *content  = path_get(RARCH_PATH_BASENAME);
    char dir[PATH_MAX_LENGTH];
    char path[PATH_MAX_LENGTH];
+   char game[PATH_MAX_LENGTH];
 
    if (!rm->ig_remaps_dirty || !settings || string_is_empty(core))
       return;
@@ -1799,6 +1866,19 @@ static void ramen_ig_save_remaps(ramen_handle_t *rm)
    fill_pathname_join_special_ext(path,
          settings->paths.directory_input_remapping, core, core,
          FILE_PATH_REMAP_EXTENSION, sizeof(path));
+   if (!string_is_empty(content))
+   {
+      fill_pathname_join_special_ext(game,
+            settings->paths.directory_input_remapping, core,
+            path_basename_nocompression(content),
+            FILE_PATH_REMAP_EXTENSION, sizeof(game));
+      if (rm->ig_remaps_game || path_is_valid(game))
+      {
+         strlcpy(path, game, sizeof(path));
+         retroarch_ctl(RARCH_CTL_SET_REMAPS_GAME_ACTIVE, NULL);
+      }
+   }
+   rm->ig_remaps_game = false;
    if (input_remapping_save_file(path))
       RARCH_LOG("[ramen] remaps saved to %s\n", path);
    else
@@ -1851,9 +1931,25 @@ static void ramen_ig_adjust(ramen_handle_t *rm, int dir)
          /* cycle through the bind order, with unmapped at the end,
           * skipping inputs the core does not use */
          unsigned *ids = settings->uints.input_remap_ids[0];
-         unsigned cur  = ids[sel];
-         bool has_descs = ramen_ig_core_has_descs();
+         unsigned cur;
+         bool has_descs;
          int pos = RAMEN_IG_BINDS, i, tries;
+
+         if (sel == 0)
+         {
+            /* the d-pad mode; a hand-made mix starts over from the d-pad */
+            int m = ramen_ig_dpad_mode(ids), d;
+            m = (m < 0) ? (dir > 0 ? IG_DPAD_LEFT_STICK : IG_DPAD_RIGHT_STICK)
+                        : (m + dir + IG_DPAD_MODES) % IG_DPAD_MODES;
+            for (d = 0; d < 4; d++)
+               ids[ramen_ig_dpad_ids[d]] = ramen_ig_dpad_targets[m][d];
+            rm->ig_remaps_dirty = true;
+            rm->ig_remaps_game  = true;   /* a per-game choice */
+            break;
+         }
+         sel--;   /* row 1 is bind 0 */
+         cur       = ids[sel];
+         has_descs = ramen_ig_core_has_descs();
          for (i = 0; i < RAMEN_IG_BINDS; i++)
             if (input_config_bind_order[i] == cur)
             {
@@ -1949,11 +2045,19 @@ static void ramen_ig_row(ramen_handle_t *rm, int row, char *label,
          }
          break;
       case IG_REMAPS:
-         if (settings && row < RAMEN_IG_BINDS)
+         if (settings && row == 0)
          {
-            strlcpy(label, input_config_bind_map_get_desc((unsigned)row), llen);
+            static const char *modes[IG_DPAD_MODES] = {
+               "D-Pad", "Left Stick", "Right Stick" };
+            int m = ramen_ig_dpad_mode(settings->uints.input_remap_ids[0]);
+            strlcpy(label, "D-Pad Drives", llen);
+            strlcpy(value, m < 0 ? "Custom" : modes[m], vlen);
+         }
+         else if (settings && row <= RAMEN_IG_BINDS)
+         {
+            strlcpy(label, input_config_bind_map_get_desc((unsigned)row - 1), llen);
             strlcpy(value, ramen_ig_remap_name(
-                     settings->uints.input_remap_ids[0][row]), vlen);
+                     settings->uints.input_remap_ids[0][row - 1]), vlen);
          }
          break;
       default:
@@ -2549,16 +2653,47 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
                                  : COLOR_ABGR(130, 205, 160, 230);
                uint32_t vc = cur ? COLOR_ABGR(200, 255, 220, 255)
                                  : COLOR_ABGR(110, 180, 140, 220);
-               float lw;
+               float lw, over;
 
                ramen_ig_row(rm, r, label, sizeof(label), value, sizeof(value));
                lw = value[0] ? (x1 - x0) * 0.58f : (x1 - x0);
-               ramen_fit_text(rm->font, label, sc, lw - rm->font_size * sc);
+               lw -= rm->font_size * sc;
                if (cur)
                   gfx_display_draw_text(rm->font, ">", x0 - rm->font_size * sc * 0.9f,
                         y, width, height, lc, TEXT_ALIGN_LEFT, sc, false, 0.0f, true);
-               gfx_display_draw_text(rm->font, label, x0, y, width, height,
-                     lc, TEXT_ALIGN_LEFT, sc, false, 0.0f, true);
+               over = (float)font_driver_get_message_width(rm->font, label,
+                     strlen(label), sc) - lw;
+               if (cur && over > 0.0f)
+               {
+                  /* scroll it inside its column: hold, run to the end,
+                   * hold, run back */
+                  float speed  = RAMEN_IG_SCROLL_EMS * rm->font_size * sc;
+                  float travel = over / speed;
+                  float cycle  = 2.0f * (RAMEN_IG_SCROLL_HOLD + travel);
+                  float u      = fmodf(rm->ig_scroll_t, cycle);
+                  float off;
+
+                  if (u < RAMEN_IG_SCROLL_HOLD)
+                     off = 0.0f;
+                  else if (u < RAMEN_IG_SCROLL_HOLD + travel)
+                     off = (u - RAMEN_IG_SCROLL_HOLD) * speed;
+                  else if (u < 2.0f * RAMEN_IG_SCROLL_HOLD + travel)
+                     off = over;
+                  else
+                     off = over - (u - 2.0f * RAMEN_IG_SCROLL_HOLD - travel) * speed;
+                  glEnable(GL_SCISSOR_TEST);
+                  glScissor((GLint)x0, (GLint)(height - (y + lh * 0.45f)),
+                        (GLsizei)lw, (GLsizei)lh);
+                  gfx_display_draw_text(rm->font, label, x0 - off, y, width,
+                        height, lc, TEXT_ALIGN_LEFT, sc, false, 0.0f, true);
+                  glDisable(GL_SCISSOR_TEST);
+               }
+               else
+               {
+                  ramen_fit_text(rm->font, label, sc, lw);
+                  gfx_display_draw_text(rm->font, label, x0, y, width, height,
+                        lc, TEXT_ALIGN_LEFT, sc, false, 0.0f, true);
+               }
                if (value[0])
                {
                   ramen_fit_text(rm->font, value, sc, (x1 - x0) * 0.40f);
@@ -2912,6 +3047,7 @@ static void ramen_toggle(void *data, bool on)
       rm->ig_closing = false;
       rm->ig_cmd     = IG_CMD_NONE;
       rm->ig_degauss = -1.0f;
+      rm->ig_scroll_page = -1;   /* restarts the label scroll */
       rm->fade       = 1.0f;
       rm->launch     = 0.0f;
       ramen_snd_play(SND_POWER);

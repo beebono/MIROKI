@@ -231,6 +231,13 @@ enum ramen_sound
 #define RAMEN_IDLE_AFTER_US  3000000
 #define RAMEN_IDLE_FRAME_US  50000
 
+/* RetroArch's menu screensaver (menu_screensaver_timeout) dims the
+ * backlight to this share of its maximum and paces the menu at 5 fps;
+ * the first press, which RetroArch keeps for itself, brings both back. */
+#define RAMEN_BACKLIGHT_DIR  "/sys/class/backlight/backlight"
+#define RAMEN_SAVER_DIM_PCT  10
+#define RAMEN_SAVER_FRAME_US 200000
+
 /* Battery and volume, as two glass vials with metal caps: stacked in the
  * carousel's top left, side by side along the bottom of the in-game menu.
  * The level comes from the fuel gauge, charging from the charger, the
@@ -352,6 +359,10 @@ typedef struct ramen_handle
 
    /* When the last render pass ended, for the idle frame pacing. */
    retro_time_t idle_mark;
+
+   /* The screensaver is up: the brightness to go back to. */
+   bool  saver;
+   int   saver_brightness;
 
    /* The game view: one list per system, loaded on first entry; the
     * game wheel is the capsule queue's rotation, same spring as the big
@@ -2168,6 +2179,8 @@ static void *ramen_init(void **userdata, bool video_is_threaded)
 }
 
 /* RetroArch frees the handle itself after this; only its contents go here. */
+static void ramen_saver(ramen_handle_t *rm, bool on);
+
 static void ramen_free(void *data)
 {
    ramen_handle_t *rm = (ramen_handle_t*)data;
@@ -2175,6 +2188,7 @@ static void ramen_free(void *data)
 
    if (!rm)
       return;
+   ramen_saver(rm, false);
    if (rm->font)
       font_driver_free(rm->font);
    rm->font = NULL;
@@ -2793,6 +2807,65 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    glDisable(GL_BLEND);
 }
 
+static int ramen_read_int(const char *path)
+{
+   char buf[32];
+
+   return ramen_read_line(path, buf, sizeof(buf)) ? atoi(buf) : -1;
+}
+
+static void ramen_write_int(const char *path, int v)
+{
+   FILE *f = fopen(path, "w");
+
+   if (!f)
+      return;
+   fprintf(f, "%d\n", v);
+   fclose(f);
+}
+
+static void ramen_saver(ramen_handle_t *rm, bool on)
+{
+   if (on && !rm->saver)
+   {
+      int cur = ramen_read_int(RAMEN_BACKLIGHT_DIR "/brightness");
+      int max = ramen_read_int(RAMEN_BACKLIGHT_DIR "/max_brightness");
+
+      if (cur <= 0 || max <= 0)
+         return;
+      rm->saver_brightness = cur;
+      rm->saver            = true;
+      ramen_write_int(RAMEN_BACKLIGHT_DIR "/brightness",
+            MAX(1, MIN(cur, max * RAMEN_SAVER_DIM_PCT / 100)));
+   }
+   else if (!on && rm->saver)
+   {
+      rm->saver = false;
+      ramen_write_int(RAMEN_BACKLIGHT_DIR "/brightness", rm->saver_brightness);
+   }
+}
+
+/* RetroArch's menu screensaver. Answering DISABLE at init is also how
+ * RetroArch learns the driver supports one. */
+static int ramen_environ(enum menu_environ_cb type, void *data, void *userdata)
+{
+   ramen_handle_t *rm = (ramen_handle_t*)userdata;
+
+   switch (type)
+   {
+      case MENU_ENVIRON_ENABLE_SCREENSAVER:
+         if (rm)
+            ramen_saver(rm, true);
+         return 0;
+      case MENU_ENVIRON_DISABLE_SCREENSAVER:
+         if (rm)
+            ramen_saver(rm, false);
+         return 0;
+      default:
+         return -1;
+   }
+}
+
 /* Nothing on screen is moving: the idle frame rate won't show. */
 static bool ramen_still(ramen_handle_t *rm)
 {
@@ -2834,12 +2907,21 @@ static void ramen_render(void *data, unsigned width, unsigned height,
       return;
 
    /* Idle pacing: stretch this pass to RAMEN_IDLE_FRAME_US once the
-    * scene is still and input has been quiet for RAMEN_IDLE_AFTER_US. */
+    * scene is still and input has been quiet for RAMEN_IDLE_AFTER_US, or
+    * to RAMEN_SAVER_FRAME_US under the screensaver. */
    now = cpu_features_get_time_usec();
-   if (!is_idle && rm->idle_mark && ramen_still(rm)
-         && now - menu_state_get_ptr()->input_last_time_us > RAMEN_IDLE_AFTER_US
-         && now - rm->idle_mark < RAMEN_IDLE_FRAME_US)
-      retro_sleep((unsigned)((RAMEN_IDLE_FRAME_US - (now - rm->idle_mark)) / 1000));
+   if (!is_idle && rm->idle_mark)
+   {
+      retro_time_t target = 0;
+
+      if (rm->saver)
+         target = RAMEN_SAVER_FRAME_US;
+      else if (ramen_still(rm)
+            && now - menu_state_get_ptr()->input_last_time_us > RAMEN_IDLE_AFTER_US)
+         target = RAMEN_IDLE_FRAME_US;
+      if (now - rm->idle_mark < target)
+         retro_sleep((unsigned)((target - (now - rm->idle_mark)) / 1000));
+   }
    rm->idle_mark = cpu_features_get_time_usec();
 
    if (rm->usb_req)
@@ -3150,7 +3232,7 @@ menu_ctx_driver_t menu_ctx_ramen = {
    NULL,                        /* bind_init */
    NULL,                        /* load_image */
    "ramen",
-   NULL,                        /* environ_cb */
+   ramen_environ,               /* environ_cb */
    NULL,                        /* update_thumbnail_path */
    NULL,                        /* update_thumbnail_image */
    NULL,                        /* refresh_thumbnail_image */

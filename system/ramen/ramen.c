@@ -401,6 +401,7 @@ static const char *ramen_frag =
    "    vec3 g = vec3(0.0);\n"
    "    if (guv.x >= 0.0 && guv.x <= 1.0 && guv.y >= 0.0 && guv.y <= 1.0)\n"
    "      g = texture(u_game, guv * u_game_uv).rgb;\n"
+   "    vec3 graw = g;\n"
    /* dim and desaturate first, then the green */
    "    float lum = dot(g, vec3(0.299, 0.587, 0.114));\n"
    "    g = mix(g, vec3(lum), 0.8) * 0.38;\n"
@@ -418,7 +419,8 @@ static const char *ramen_frag =
    "    float vy = u_ig_open.y;\n"
    "    float inside = step(abs(c.x), hx) * step(abs(c.y), vy);\n"
    "    float boost = 1.0 + 3.0 * (1.0 - vy) * (1.0 - vy) + 2.0 * (1.0 - hx);\n"
-   "    col = col * inside * boost;\n"
+   /* outside the raster the frame shows at half brightness */
+   "    col = mix(graw * 0.5, col * boost, inside);\n"
    "    vec3 glow = vec3(0.6, 1.0, 0.75);\n"
    "    float line = exp(-abs(v_px.y - u_size.y * 0.5) / 2.5) * step(abs(c.x), hx) * (1.0 - vy);\n"
    "    float dot_ = exp(-length(v_px - u_size * 0.5) / (3.0 + 30.0 * hx)) * (1.0 - vy) * (1.0 - hx);\n"
@@ -1484,6 +1486,20 @@ static const char *ramen_ig_title(ramen_handle_t *rm, char *buf, size_t len)
 
 /* ---- launching a game ------------------------------------------------ */
 
+/* Back from a game: fade in on the monitor's glass and pull out. */
+static void ramen_return_from_game(ramen_handle_t *rm)
+{
+   rm->state    = RAMEN_GAME;
+   rm->started  = false;
+   rm->seq      = 1.0f;
+   rm->mon      = 1.0f;
+   rm->gintro   = 100.0f;
+   rm->goutro   = 0.0f;
+   rm->snap_cam = true;
+   rm->fade     = 0.0f;
+   rm->launch   = 1.0f;
+}
+
 static void ramen_start_game(ramen_handle_t *rm)
 {
    content_ctx_info_t info;
@@ -2021,8 +2037,16 @@ static void ramen_render(void *data, unsigned width, unsigned height,
       rm->started = true;
       ramen_start_game(rm);
    }
+   /* The core went away under the in-game menu (Exit Game, or the core
+    * quitting on its own). The menu was already up, so RetroArch does
+    * not toggle it again: notice here and play the return. */
+   if (rm->state == RAMEN_INGAME && retroarch_ctl(RARCH_CTL_IS_DUMMY_CORE, NULL))
+   {
+      ramen_return_from_game(rm);
+      return;
+   }
    /* The in-game menu has collapsed: do what was picked. Resuming closes
-    * the menu; unloading the core brings it back through toggle(). */
+    * the menu; unloading the core is noticed above on a later pass. */
    if (rm->state == RAMEN_INGAME && rm->ig_closing && rm->ig_h <= 0.0f
          && rm->ig_cmd != IG_CMD_NONE)
    {
@@ -2249,11 +2273,7 @@ static void ramen_toggle(void *data, bool on)
       rm->launch     = 0.0f;
    }
    else
-   {
-      rm->state  = RAMEN_GAME;
-      rm->fade   = 0.0f;
-      rm->launch = 1.0f;
-   }
+      ramen_return_from_game(rm);
 }
 
 static void ramen_render_messagebox(void *data, const char *msg)

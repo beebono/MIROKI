@@ -21,7 +21,7 @@
 // to sleep. Sleep is suspend-to-idle: the EL3 monitor has no CPU_SUSPEND
 // yet, so "mem" is out, and the sprd DRM driver has no suspend hooks, so
 // the backlight is switched off around it by hand. Holding the power key
-// for two seconds powers off.
+// for two seconds powers off, with a short buzz to say the hold took.
 
 #include <dirent.h>
 #include <errno.h>
@@ -48,6 +48,7 @@
 #define VOLUME_MAX    15
 #define BACKLIGHT     "/sys/class/backlight/backlight/bl_power"
 #define POWEROFF_HOLD_MS 2000
+#define POWEROFF_BUZZ_MS 250
 #define WAKE_GRACE_MS    500
 #define VIBRA_NAME    "vibrator"
 #define VIRTUAL_NAME  "MIROKI Gamepad"
@@ -370,11 +371,35 @@ static void go_to_sleep(const char *why)
     klog("awake");
 }
 
+// A short buzz once the hold has registered, so it can't be mistaken for
+// a sleep. It plays out before poweroff: the effect stops when its owner
+// closes the vibrator, and init is about to kill us.
+static void power_off_buzz(void)
+{
+    struct ff_effect effect;
+
+    if (vibra_fd < 0)
+        return;
+    memset(&effect, 0, sizeof(effect));
+    effect.type = FF_RUMBLE;
+    effect.id = -1;
+    effect.u.rumble.strong_magnitude = 0xffff;
+    effect.replay.length = POWEROFF_BUZZ_MS;
+    if (ioctl(vibra_fd, EVIOCSFF, &effect) < 0)
+    {
+        klog("power-off buzz: %s", strerror(errno));
+        return;
+    }
+    emit(vibra_fd, EV_FF, effect.id, 1);
+    usleep(POWEROFF_BUZZ_MS * 1000);
+}
+
 static void power_off(void)
 {
     char *argv[] = { "poweroff", NULL };
 
     klog("power key held: powering off");
+    power_off_buzz();
     write_str(BACKLIGHT, "1");
     run(argv);
 }

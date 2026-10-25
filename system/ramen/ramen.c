@@ -203,6 +203,8 @@ enum
 enum ramen_sound
 {
    SND_TICK = AUDIO_MIXER_SYSTEM_SLOT_OK,
+   SND_TICK1,            /* the tick rotates over three slots, so that */
+   SND_TICK2,            /* a fast run of steps does not drop any */
    SND_CONFIRM,
    SND_BACK,
    SND_THUNK,
@@ -750,6 +752,8 @@ static unsigned ramen_snd_synth(enum ramen_sound which, int16_t *pcm,
    unsigned n, i;
    float len;
 
+   if (which == SND_TICK1 || which == SND_TICK2)
+      which = SND_TICK;
    switch (which)
    {
       case SND_TICK:    len = 0.035f; break;
@@ -811,12 +815,23 @@ static unsigned ramen_snd_synth(enum ramen_sound which, int16_t *pcm,
       v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
       pcm[i] = (int16_t)(v * 32767.0f);
    }
+   /* No cue ends at exactly zero: fade the last few ms out, and the
+    * first ms in, so neither edge pops. */
+   {
+      unsigned tail = MIN(n, (unsigned)(0.008f * sr));
+      unsigned head = MIN(n, (unsigned)(0.001f * sr));
+      for (i = 0; i < tail; i++)
+         pcm[n - 1 - i] = (int16_t)(pcm[n - 1 - i] * (float)i / (float)tail);
+      for (i = 0; i < head; i++)
+         pcm[i] = (int16_t)(pcm[i] * (float)i / (float)head);
+   }
    return n;
 }
 
 static void ramen_snd_load(void)
 {
-   static const char *names[] = { "tick", "confirm", "back", "thunk", "power", "off" };
+   static const char *names[] = { "tick", "tick1", "tick2", "confirm", "back",
+      "thunk", "power", "off" };
    int16_t *pcm = (int16_t*)malloc(RAMEN_SND_RATE * sizeof(int16_t));
    unsigned k;
 
@@ -833,6 +848,13 @@ static void ramen_snd_load(void)
 
 static void ramen_snd_play(enum ramen_sound which)
 {
+   static unsigned tick_slot = 0;
+
+   if (which == SND_TICK)
+   {
+      which     = (enum ramen_sound)(SND_TICK + tick_slot);
+      tick_slot = (tick_slot + 1) % 3;
+   }
    if (audio_driver_mixer_get_stream_state(which) == AUDIO_STREAM_STATE_NONE)
       ramen_snd_load();
    audio_driver_mixer_play_stream(which);

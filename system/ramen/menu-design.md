@@ -97,16 +97,7 @@ The screen lights up as it lands. The wheel should look as if it has been spinni
 - **Power-on.** As the camera arrives, the monitor flickers on with a CRT-style power-on: a bright horizontal line expands vertically into the full picture. This echoes the device's own screen waking at the start.
 - **Contents.** Metadata for the highlighted game: title, year, play time, and similar details, plus box art and/or a gameplay video preview when either is provided. Without them, the dark green background and the text carry the screen on their own.
 
-## Sequence 4: Emulator settings (degauss)
-
-Opening the selected system's emulator settings triggers a degauss on the monitor.
-
-- **Reference.** A real degauss is an audible "thunk" followed by a decaying hum, while the picture wobbles and warps and the wobble dies away over one to two seconds.
-- **Compressed timing.** The effect is compressed to about 400–600 ms with an exponential decay, so most of the wobble happens in the first third.
-- **Settings content.** The settings render only after the wobble settles, so the degauss reads as the monitor switching modes rather than as decoration.
-- **Color purity swirl.** Because the monitor is a color CRT, the rainbow color blotches associated with degaussing are physically accurate: they come from the electron beams landing slightly off the shadow mask while it is magnetized. The swirl should be most visible over the dark green background and any box art or video on screen, and should decay along with the geometry wobble.
-
-## Sequence 5: Game launch
+## Sequence 4: Game launch
 
 1. **Zoom in.** The camera zooms into the monitor's glass until the bezel leaves the frame. Scanlines scale up with the zoom, creating the sense of "falling into" the screen.
 2. **Fade.** The picture fades to black, and audio fades out with it.
@@ -115,12 +106,21 @@ Opening the selected system's emulator settings triggers a degauss on the monito
 
 **Exiting a game** reverses this sequence: fade in already zoomed into the glass, then pull back out to the full monitor in the game view.
 
-## Sequence 6: In-game menu
+## Sequence 5: In-game menu
 
 - **Background.** The paused game frame is shown behind a green-tinted panel that matches the monitor's dark green background, with a faint scanline overlay, as if the game were being viewed on the monitor.
 - **Open.** The menu opens with the CRT power-on effect: a horizontal line expanding vertically.
 - **Close.** The menu closes with the classic power-off collapse: the picture squeezes to a horizontal line, then to a dot.
 - **Readability.** The paused frame is dimmed and desaturated *before* the green tint is applied. Otherwise bright or busy frames can wash out green text, and contrast would vary heavily from game to game.
+
+## Sequence 6: Emulator settings (degauss)
+
+Opening the selected system's emulator settings triggers a degauss on the monitor.
+
+- **Reference.** A real degauss is an audible "thunk" followed by a decaying hum, while the picture wobbles and warps and the wobble dies away over one to two seconds.
+- **Compressed timing.** The effect is compressed to about 400–600 ms with an exponential decay, so most of the wobble happens in the first third.
+- **Settings content.** The settings render only after the wobble settles, so the degauss reads as the monitor switching modes rather than as decoration.
+- **Color purity swirl.** Because the monitor is a color CRT, the rainbow color blotches associated with degaussing are physically accurate: they come from the electron beams landing slightly off the shadow mask while it is magnetized. The swirl should be most visible over the dark green background and any box art or video on screen, and should decay along with the geometry wobble.
 
 ## Back navigation
 

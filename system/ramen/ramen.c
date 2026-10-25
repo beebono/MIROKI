@@ -23,6 +23,7 @@
  */
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,7 @@
 #include "../menu_driver.h"
 #include "../../retroarch.h"
 #include "../../command.h"
+#include "../../audio/audio_driver.h"
 #include "../../core_option_manager.h"
 #include "../../runloop.h"
 #include "../../file_path_special.h"
@@ -192,6 +194,27 @@ enum
    IG_TOP_COUNT
 };
 
+/* Sounds: short synthesised cues, loaded into the mixer's system slots as
+ * WAVs built in memory. The audio driver is torn down with every core
+ * load and takes the mixer's streams with it, so they are reloaded
+ * whenever a slot turns up empty. */
+#define RAMEN_SND_RATE    44100
+#define RAMEN_SND_VOL     0.55f
+enum ramen_sound
+{
+   SND_TICK = AUDIO_MIXER_SYSTEM_SLOT_OK,
+   SND_CONFIRM,
+   SND_BACK,
+   SND_THUNK,
+   SND_POWER,
+   SND_OFF,
+   SND_END
+};
+
+/* USB storage from the carousel: Start hands /data to the host, a host
+ * eject (or Start again) takes it back; /data is polled this often. */
+#define RAMEN_USB_POLL_S  0.5f
+
 /* Pivot corner in screen space (origin top-left, y down): the design is
  * written for the open orientation, pivot at the bottom-right. Switch these
  * if the panel comes up with the hinge elsewhere. */
@@ -224,7 +247,8 @@ enum ramen_state
    RAMEN_GAME,           /* the game view */
    RAMEN_RETURNING,      /* games fall out, then seq runs 1 -> 0 */
    RAMEN_STARTING,       /* diving into the glass, then the core loads */
-   RAMEN_INGAME          /* the in-game menu over the paused frame */
+   RAMEN_INGAME,         /* the in-game menu over the paused frame */
+   RAMEN_USB             /* /data exported to the host */
 };
 
 typedef struct ramen_handle
@@ -269,6 +293,13 @@ typedef struct ramen_handle
    enum ramen_ig_cmd ig_cmd;
    float ig_degauss;     /* seconds since the page switch, or -1 */
    bool  ig_remaps_dirty;
+
+   /* Boot spin ticks, USB storage, and a notice line in the carousel. */
+   int   boot_slot;
+   int   usb_req;        /* 1 = export, 2 = take back */
+   float usb_poll;
+   char  notice[128];
+   float notice_t;
 
    /* The game view: one list per system, loaded on first entry; the
     * game wheel is the capsule queue's rotation, same spring as the big
@@ -662,6 +693,228 @@ static void ramen_spring(float *x, float *v, float target, float hz,
    *x += *v * dt;
 }
 
+/* ---- sounds ------------------------------------------------------------ */
+
+static float ramen_noise(void)
+{
+   static uint32_t x = 0x9e3779b9u;
+   x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+   return (float)(x & 0xffff) / 32768.0f - 1.0f;
+}
+
+static bool ramen_snd_add(unsigned slot, const char *name,
+      const int16_t *pcm, unsigned frames)
+{
+   audio_mixer_stream_params_t params;
+   size_t data = (size_t)frames * 2;
+   size_t n    = 44 + data;
+   uint8_t *b  = (uint8_t*)malloc(n);
+   char basename[16];
+   bool ok;
+
+   if (!b)
+      return false;
+   /* RIFF / WAVE, 16-bit mono */
+#define W32(o, v) do { uint32_t _v = (v); b[o] = _v & 0xff; b[o+1] = (_v >> 8) & 0xff; \
+      b[o+2] = (_v >> 16) & 0xff; b[o+3] = (_v >> 24) & 0xff; } while (0)
+#define W16(o, v) do { uint16_t _v = (v); b[o] = _v & 0xff; b[o+1] = (_v >> 8) & 0xff; } while (0)
+   memcpy(b, "RIFF", 4); W32(4, (uint32_t)(n - 8)); memcpy(b + 8, "WAVE", 4);
+   memcpy(b + 12, "fmt ", 4); W32(16, 16); W16(20, 1); W16(22, 1);
+   W32(24, RAMEN_SND_RATE); W32(28, RAMEN_SND_RATE * 2); W16(32, 2); W16(34, 16);
+   memcpy(b + 36, "data", 4); W32(40, (uint32_t)data);
+#undef W32
+#undef W16
+   memcpy(b + 44, pcm, data);
+   strlcpy(basename, name, sizeof(basename));
+   memset(&params, 0, sizeof(params));
+   params.buf                 = b;
+   params.bufsize             = n;
+   params.basename            = basename;
+   params.volume              = 1.0f;
+   params.slot_selection_type = AUDIO_MIXER_SLOT_SELECTION_MANUAL;
+   params.slot_selection_idx  = slot;
+   params.stream_type         = AUDIO_STREAM_TYPE_SYSTEM;
+   params.type                = AUDIO_MIXER_TYPE_WAV;
+   params.state               = AUDIO_STREAM_STATE_STOPPED;
+   ok = audio_driver_mixer_add_stream(&params);   /* copies the buffer */
+   free(b);
+   return ok;
+}
+
+/* Synthesises one cue: frames at RAMEN_SND_RATE. */
+static unsigned ramen_snd_synth(enum ramen_sound which, int16_t *pcm,
+      unsigned max)
+{
+   const float sr = (float)RAMEN_SND_RATE;
+   double phase = 0.0;
+   unsigned n, i;
+   float len;
+
+   switch (which)
+   {
+      case SND_TICK:    len = 0.035f; break;
+      case SND_CONFIRM: len = 0.14f;  break;
+      case SND_BACK:    len = 0.12f;  break;
+      case SND_THUNK:   len = 0.75f;  break;
+      case SND_POWER:   len = 0.30f;  break;
+      default:          len = 0.22f;  break;
+   }
+   n = MIN(max, (unsigned)(len * sr));
+   for (i = 0; i < n; i++)
+   {
+      float t = (float)i / sr;
+      float v = 0.0f, f = 0.0f;
+
+      switch (which)
+      {
+         case SND_TICK:
+            /* a prize-wheel peg: a short bright click */
+            f = 1900.0f;
+            v = sinf((float)phase) * expf(-t * 140.0f) * 0.7f
+              + ramen_noise() * expf(-t * 400.0f) * 0.35f;
+            break;
+         case SND_CONFIRM:
+            /* a rising two-step blip */
+            f = t < 0.06f ? 620.0f : 930.0f;
+            v = sinf((float)phase) * (1.0f - expf(-t * 900.0f)) * expf(-t * 16.0f) * 0.6f;
+            break;
+         case SND_BACK:
+            /* and the same, falling */
+            f = t < 0.05f ? 820.0f : 520.0f;
+            v = sinf((float)phase) * (1.0f - expf(-t * 900.0f)) * expf(-t * 20.0f) * 0.5f;
+            break;
+         case SND_THUNK:
+            /* the degauss: a thud, then a mains hum dying away */
+            f = 60.0f;
+            v = sinf(2.0f * (float)M_PI * 68.0f * t) * expf(-t * 24.0f) * 0.9f
+              + ramen_noise() * expf(-t * 110.0f) * 0.45f;
+            if (t > 0.03f)
+               v += (sinf((float)phase) + 0.45f * sinf(2.0f * (float)phase)
+                     + 0.2f * sinf(3.0f * (float)phase))
+                  * 0.28f * expf(-(t - 0.03f) * 4.5f);
+            break;
+         case SND_POWER:
+            /* the CRT coming up: a swell and a high ping */
+            f = 160.0f + 900.0f * MIN(1.0f, t / 0.18f);
+            v = sinf((float)phase) * (1.0f - expf(-t * 50.0f)) * expf(-t * 11.0f) * 0.45f;
+            if (t > 0.05f)
+               v += sinf(2.0f * (float)M_PI * 2600.0f * t) * expf(-(t - 0.05f) * 35.0f) * 0.18f;
+            break;
+         default:
+            /* power off: a falling sweep */
+            f = 950.0f - 820.0f * MIN(1.0f, t / 0.16f);
+            v = sinf((float)phase) * (1.0f - expf(-t * 900.0f)) * expf(-t * 15.0f) * 0.5f;
+            break;
+      }
+      phase += 2.0 * M_PI * f / sr;
+      v *= RAMEN_SND_VOL;
+      v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+      pcm[i] = (int16_t)(v * 32767.0f);
+   }
+   return n;
+}
+
+static void ramen_snd_load(void)
+{
+   static const char *names[] = { "tick", "confirm", "back", "thunk", "power", "off" };
+   int16_t *pcm = (int16_t*)malloc(RAMEN_SND_RATE * sizeof(int16_t));
+   unsigned k;
+
+   if (!pcm)
+      return;
+   for (k = SND_TICK; k < SND_END; k++)
+   {
+      unsigned n = ramen_snd_synth((enum ramen_sound)k, pcm, RAMEN_SND_RATE);
+      if (!ramen_snd_add(k, names[k - SND_TICK], pcm, n))
+         RARCH_WARN("[ramen] could not load the %s sound\n", names[k - SND_TICK]);
+   }
+   free(pcm);
+}
+
+static void ramen_snd_play(enum ramen_sound which)
+{
+   if (audio_driver_mixer_get_stream_state(which) == AUDIO_STREAM_STATE_NONE)
+      ramen_snd_load();
+   audio_driver_mixer_play_stream(which);
+}
+
+/* ---- USB storage ------------------------------------------------------- */
+
+static bool ramen_data_mounted(void)
+{
+   FILE *f = fopen("/proc/mounts", "r");
+   char line[512];
+   bool found = false;
+
+   if (!f)
+      return false;
+   while (fgets(line, sizeof(line), f))
+      if (strstr(line, " /data "))
+      {
+         found = true;
+         break;
+      }
+   fclose(f);
+   return found;
+}
+
+static void ramen_notice(ramen_handle_t *rm, const char *msg, float secs)
+{
+   strlcpy(rm->notice, msg, sizeof(rm->notice));
+   rm->notice_t = secs;
+}
+
+/* /data may have changed under us: forget what was read from it. */
+static void ramen_forget_data(ramen_handle_t *rm)
+{
+   int i;
+
+   for (i = 0; i < RAMEN_SYSTEMS; i++)
+   {
+      if (rm->games[i])
+         string_list_free(rm->games[i]);
+      rm->games[i]        = NULL;
+      rm->games_loaded[i] = false;
+   }
+   rm->meta_sys = rm->meta_game = -1;
+   for (i = 0; i < RAMEN_ART_LAYERS; i++)
+      rm->art[i].sys = -1;
+   rm->game = 0;
+}
+
+/* Runs the gadget script: from render(), since it blocks for a moment. */
+static void ramen_usb_run(ramen_handle_t *rm)
+{
+   int req = rm->usb_req;
+   int r;
+
+   rm->usb_req = 0;
+   if (req == 1)
+   {
+      r = system("usb-gadget storage on");
+      if (r == 0)
+      {
+         rm->state    = RAMEN_USB;
+         rm->usb_poll = 0.0f;
+         rm->notice[0] = '\0';
+      }
+      else
+         ramen_notice(rm, "Could not share the drive: /data is busy", 4.0f);
+   }
+   else if (req == 2)
+   {
+      r = system("usb-gadget storage off");
+      if (r == 0 || ramen_data_mounted())
+      {
+         rm->state = RAMEN_SYSTEM;
+         ramen_forget_data(rm);
+         ramen_snd_play(SND_BACK);
+      }
+      else
+         ramen_notice(rm, "The host still holds the drive: eject it there first", 4.0f);
+   }
+}
+
 /* ---- persistence ----------------------------------------------------- */
 
 static int ramen_load_last_system(void)
@@ -1011,6 +1264,7 @@ static void ramen_begin_boot_spin(ramen_handle_t *rm, int system)
    rm->boot_spin    = true;
    rm->settled      = false;
    rm->label        = 0.0f;
+   rm->boot_slot    = (int)floorf((rm->wheel - rm->wheel_target) / RAMEN_SLOT_DEG);
 }
 
 static void ramen_snap(ramen_handle_t *rm)
@@ -1029,7 +1283,7 @@ static void ramen_step(ramen_handle_t *rm, int dir)
    rm->wheel_target += dir * RAMEN_SLOT_DEG;
    rm->settled       = false;
    rm->label         = 0.0f;
-   /* TODO: tick sound */
+   ramen_snd_play(SND_TICK);
 }
 
 static float ramen_game_slot(unsigned n)
@@ -1050,6 +1304,7 @@ static void ramen_game_step(ramen_handle_t *rm, int dir)
    rm->game = ((rm->game + dir) % n + n) % n;
    rm->gwheel_target += dir * rm->gslot;
    rm->gsettled       = false;
+   ramen_snd_play(SND_TICK);
 }
 
 static void ramen_update(ramen_handle_t *rm, retro_time_t now)
@@ -1069,10 +1324,18 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
       float w   = 2.0f * (float)M_PI * RAMEN_SPRING_HZ;
       float d;
 
+      int slot;
+
       rm->wheel_vel *= expf(-RAMEN_BOOT_FRICTION * dt);
       rm->wheel     += rm->wheel_vel * dt;
       d              = rm->wheel_target - rm->wheel;
-      /* TODO: a tick each time a sphere crosses a slot boundary */
+      /* a tick each time a sphere crosses a slot boundary */
+      slot = (int)floorf((rm->wheel - rm->wheel_target) / RAMEN_SLOT_DEG);
+      if (slot != rm->boot_slot)
+      {
+         rm->boot_slot = slot;
+         ramen_snd_play(SND_TICK);
+      }
       /* Hand over once the spring's damping would outweigh its pull:
        * w^2 d <= 2 zeta w v. The wheel then only decelerates. */
       if (d <= 2.0f * RAMEN_SPRING_ZETA * rm->wheel_vel / w
@@ -1146,10 +1409,36 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
 
    /* The monitor comes on once the sphere has parked and goes off as
     * the games start falling out. */
-   if (rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING)
-      rm->mon = MIN(1.0f, rm->mon + dt / RAMEN_MON_ON_S);
-   else
-      rm->mon = MAX(0.0f, rm->mon - dt / RAMEN_MON_OFF_S);
+   {
+      float was = rm->mon;
+      if (rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING)
+         rm->mon = MIN(1.0f, rm->mon + dt / RAMEN_MON_ON_S);
+      else
+         rm->mon = MAX(0.0f, rm->mon - dt / RAMEN_MON_OFF_S);
+      if (was <= 0.0f && rm->mon > 0.0f)
+         ramen_snd_play(SND_POWER);
+      else if (was >= 1.0f && rm->mon < 1.0f)
+         ramen_snd_play(SND_OFF);
+   }
+
+   if (rm->notice_t > 0.0f)
+      rm->notice_t -= dt;
+
+   /* Exported: once the host ejects, the gadget script remounts /data. */
+   if (rm->state == RAMEN_USB)
+   {
+      rm->usb_poll += dt;
+      if (rm->usb_poll >= RAMEN_USB_POLL_S)
+      {
+         rm->usb_poll = 0.0f;
+         if (ramen_data_mounted())
+         {
+            rm->state = RAMEN_SYSTEM;
+            ramen_forget_data(rm);
+            ramen_snd_play(SND_BACK);
+         }
+      }
+   }
 
    if (rm->state == RAMEN_INGAME)
    {
@@ -1317,7 +1606,7 @@ static void ramen_ig_goto(ramen_handle_t *rm, enum ramen_ig_page page)
       ramen_ig_save_remaps(rm);
    rm->ig_page    = page;
    rm->ig_degauss = 0.0f;
-   /* TODO: the degauss thunk and hum */
+   ramen_snd_play(SND_THUNK);
 }
 
 static void ramen_ig_close(ramen_handle_t *rm, enum ramen_ig_cmd cmd)
@@ -1326,6 +1615,7 @@ static void ramen_ig_close(ramen_handle_t *rm, enum ramen_ig_cmd cmd)
       ramen_ig_save_remaps(rm);
    rm->ig_closing = true;
    rm->ig_cmd     = cmd;
+   ramen_snd_play(SND_OFF);
 }
 
 /* Left/Right on a row: the state slot, a core option, or a remap. */
@@ -1888,6 +2178,32 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
                COLOR_ABGR(255, 255, 255, (unsigned)(ease * alpha)),
                TEXT_ALIGN_CENTER, 1.0f, false, 0.0f, true);
       }
+      if (rm->state == RAMEN_SYSTEM && rm->notice_t > 0.0f)
+         gfx_display_draw_text(rm->font, rm->notice, width * 0.06f,
+               height * 0.14f, width, height,
+               COLOR_ABGR(255, 200, 120, alpha), TEXT_ALIGN_LEFT, 0.45f,
+               false, 0.0f, true);
+      else if (rm->state == RAMEN_USB)
+      {
+         float x = width * 0.06f;
+         float y = height * 0.14f;
+         gfx_display_draw_text(rm->font, "USB drive", x, y, width, height,
+               COLOR_ABGR(255, 255, 255, alpha), TEXT_ALIGN_LEFT, 0.7f,
+               false, 0.0f, true);
+         gfx_display_draw_text(rm->font, "Shared with the host.", x,
+               y + rm->font_size * 0.9f, width, height,
+               COLOR_ABGR(190, 205, 220, alpha), TEXT_ALIGN_LEFT, 0.45f,
+               false, 0.0f, true);
+         gfx_display_draw_text(rm->font, "Eject it there, or press Start.", x,
+               y + rm->font_size * 1.5f, width, height,
+               COLOR_ABGR(190, 205, 220, alpha), TEXT_ALIGN_LEFT, 0.45f,
+               false, 0.0f, true);
+         if (rm->notice_t > 0.0f)
+            gfx_display_draw_text(rm->font, rm->notice, x,
+                  y + rm->font_size * 2.4f, width, height,
+                  COLOR_ABGR(255, 200, 120, alpha), TEXT_ALIGN_LEFT, 0.45f,
+                  false, 0.0f, true);
+      }
       else if (rm->state == RAMEN_INGAME)
       {
          /* The page, once the raster is open and the degauss has settled:
@@ -2031,6 +2347,8 @@ static void ramen_render(void *data, unsigned width, unsigned height,
 
    if (!rm)
       return;
+   if (rm->usb_req)
+      ramen_usb_run(rm);
    /* Black, and the core takes over from here. */
    if (rm->state == RAMEN_STARTING && rm->fade <= 0.0f && !rm->started)
    {
@@ -2120,11 +2438,19 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
             case MENU_ACTION_RIGHT:
                ramen_step(rm, 1);
                break;
+            case MENU_ACTION_START:
+               if (rm->settled && !rm->usb_req)
+               {
+                  rm->usb_req = 1;
+                  ramen_snd_play(SND_CONFIRM);
+               }
+               break;
             case MENU_ACTION_OK:
                if (!rm->settled)
                   break;
                rm->system        = ramen_selected_system(rm);
                rm->jiggle        = 1.0f;
+               ramen_snd_play(SND_CONFIRM);
                rm->seq           = 0.0f;
                rm->state         = RAMEN_LAUNCHING;
                rm->gwheel        = rm->gwheel_target = 0.0f;
@@ -2183,11 +2509,13 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
                {
                   rm->state   = RAMEN_STARTING;
                   rm->started = false;
+                  ramen_snd_play(SND_CONFIRM);
                }
                break;
             case MENU_ACTION_CANCEL:
                rm->state  = RAMEN_RETURNING;
                rm->goutro = 0.0f;
+               ramen_snd_play(SND_BACK);
                break;
             default:
                break;
@@ -2195,6 +2523,12 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
          break;
 
       case RAMEN_STARTING:
+         break;
+
+      case RAMEN_USB:
+         if ((action == MENU_ACTION_START || action == MENU_ACTION_CANCEL)
+               && !rm->usb_req)
+            rm->usb_req = 2;
          break;
 
       case RAMEN_INGAME:
@@ -2211,15 +2545,19 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
          {
             case MENU_ACTION_UP:
                if (n) *sel = (*sel + n - 1) % n;
+               ramen_snd_play(SND_TICK);
                break;
             case MENU_ACTION_DOWN:
                if (n) *sel = (*sel + 1) % n;
+               ramen_snd_play(SND_TICK);
                break;
             case MENU_ACTION_LEFT:
                ramen_ig_adjust(rm, -1);
+               ramen_snd_play(SND_TICK);
                break;
             case MENU_ACTION_RIGHT:
                ramen_ig_adjust(rm, 1);
+               ramen_snd_play(SND_TICK);
                break;
             case MENU_ACTION_OK:
                ramen_ig_activate(rm);
@@ -2271,6 +2609,7 @@ static void ramen_toggle(void *data, bool on)
       rm->ig_degauss = -1.0f;
       rm->fade       = 1.0f;
       rm->launch     = 0.0f;
+      ramen_snd_play(SND_POWER);
    }
    else
       ramen_return_from_game(rm);

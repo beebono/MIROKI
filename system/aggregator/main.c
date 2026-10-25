@@ -13,6 +13,15 @@
 // (BTN_THUMBR) included, as plain buttons for RetroArch to bind. Its
 // ABS_X/ABS_Y never move: they are there because libudev-zero only tags a
 // device ID_INPUT_JOYSTICK when it has EV_ABS.
+//
+// It also owns the system keys (gpio-keys-system, grabbed so RetroArch
+// never sees them): the volume keys step softvol's "MIROKI Playback
+// Volume" through tmix and keep /data/.config/audio_level current (rcS
+// restores it); the power key and the swivel's hall switch put the device
+// to sleep. Sleep is suspend-to-idle: the EL3 monitor has no CPU_SUSPEND
+// yet, so "mem" is out, and the sprd DRM driver has no suspend hooks, so
+// the backlight is switched off around it by hand. Holding the power key
+// for two seconds powers off.
 
 #include <dirent.h>
 #include <errno.h>
@@ -24,11 +33,22 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define GAMEPAD_NAME  "gpio-keys-gamepad"
+#define SYSTEM_NAME   "gpio-keys-system"
+#define VOLUME_CTL    "MIROKI Playback Volume"
+#define VOLUME_FILE   "/data/.config/audio_level"
+#define VOLUME_MAX    15
+#define BACKLIGHT     "/sys/class/backlight/backlight/bl_power"
+#define POWEROFF_HOLD_MS 2000
+#define WAKE_GRACE_MS    500
 #define VIBRA_NAME    "vibrator"
 #define VIRTUAL_NAME  "MIROKI Gamepad"
 #define MAX_FF_SLOTS  8
@@ -39,8 +59,12 @@
 #define TEST_BIT(arr, b)  (((arr)[(b) / BITS_PER_LONG] >> ((b) % BITS_PER_LONG)) & 1)
 
 static int gamepad_fd = -1;
+static int system_fd = -1;
 static int vibra_fd = -1;
 static int uinput_fd = -1;
+static int volume = 6;
+static long long power_down_ms = -1;   // when the power key went down
+static long long wake_grace_until = 0; // ignore system keys until then
 
 // uinput effect id -> vibrator effect id (or -1)
 static int ff_map[MAX_FF_SLOTS];
@@ -257,6 +281,142 @@ static void handle_uinput_event(void)
     }
 }
 
+static long long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+}
+
+static void write_str(const char *path, const char *val)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    write(fd, val, strlen(val));
+    close(fd);
+}
+
+static int run(char *const argv[])
+{
+    pid_t pid = fork();
+    int status = -1;
+
+    if (pid == 0)
+    {
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    if (pid > 0)
+        waitpid(pid, &status, 0);
+    return status;
+}
+
+// ---- volume ---------------------------------------------------------------
+
+static void volume_load(void)
+{
+    FILE *f = fopen(VOLUME_FILE, "r");
+    int v;
+
+    if (!f)
+        return;
+    if (fscanf(f, "%d", &v) == 1 && v >= 0 && v <= VOLUME_MAX)
+        volume = v;
+    fclose(f);
+}
+
+static void volume_step(int dir)
+{
+    char level[8];
+    char *argv[] = { "tmix", VOLUME_CTL, level, NULL };
+    FILE *f;
+
+    volume += dir;
+    if (volume < 0)
+        volume = 0;
+    if (volume > VOLUME_MAX)
+        volume = VOLUME_MAX;
+    snprintf(level, sizeof(level), "%d", volume);
+    if (run(argv) != 0)
+        klog("tmix '%s' %s failed", VOLUME_CTL, level);
+    mkdir("/data/.config", 0755);
+    f = fopen(VOLUME_FILE, "w");
+    if (f)
+    {
+        fprintf(f, "%d\n", volume);
+        fclose(f);
+    }
+}
+
+// ---- sleep and power --------------------------------------------------------
+
+static void go_to_sleep(const char *why)
+{
+    int fd;
+
+    klog("sleeping (%s)", why);
+    write_str(BACKLIGHT, "1");
+    sync();
+    fd = open("/sys/power/state", O_WRONLY | O_CLOEXEC);
+    if (fd < 0 || write(fd, "freeze", 6) < 0)
+        klog("suspend failed: %s", strerror(errno));
+    if (fd >= 0)
+        close(fd);
+    write_str(BACKLIGHT, "0");
+    // The wake-up key's own events follow: let them pass.
+    wake_grace_until = now_ms() + WAKE_GRACE_MS;
+    power_down_ms = -1;
+    klog("awake");
+}
+
+static void power_off(void)
+{
+    char *argv[] = { "poweroff", NULL };
+
+    klog("power key held: powering off");
+    write_str(BACKLIGHT, "1");
+    run(argv);
+}
+
+static void handle_system_event(void)
+{
+    struct input_event ev;
+
+    while (read(system_fd, &ev, sizeof(ev)) == sizeof(ev))
+    {
+        if (now_ms() < wake_grace_until)
+            continue;
+        if (ev.type == EV_KEY)
+        {
+            switch (ev.code)
+            {
+            case KEY_VOLUMEUP:
+                if (ev.value)
+                    volume_step(1);
+                break;
+            case KEY_VOLUMEDOWN:
+                if (ev.value)
+                    volume_step(-1);
+                break;
+            case KEY_POWER:
+                if (ev.value == 1)
+                    power_down_ms = now_ms();
+                else if (ev.value == 0 && power_down_ms >= 0)
+                {
+                    power_down_ms = -1;
+                    go_to_sleep("power key");
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        else if (ev.type == EV_SW && ev.code == SW_LID && ev.value)
+            go_to_sleep("swivel closed");
+    }
+}
+
 // Buttons and sync pass straight through.
 static void handle_gamepad_event(void)
 {
@@ -301,6 +461,11 @@ int main(void)
     if (vibra_fd < 0)
         klog("vibrator '%s' not found, rumble disabled", VIBRA_NAME);
 
+    system_fd = find_device_by_name(SYSTEM_NAME, true);
+    if (system_fd < 0)
+        klog("system keys '%s' not found: no volume keys or sleep", SYSTEM_NAME);
+    volume_load();
+
     uinput_fd = create_virtual_pad();
     if (uinput_fd < 0)
         return 1;
@@ -308,14 +473,28 @@ int main(void)
     klog("up: virtual pad created (gamepad grabbed, rumble %s)",
          vibra_fd >= 0 ? "on" : "off");
 
-    struct pollfd fds[2] = {
+    struct pollfd fds[3] = {
         { .fd = gamepad_fd, .events = POLLIN },
         { .fd = uinput_fd, .events = POLLIN },
+        { .fd = system_fd, .events = POLLIN },
     };
 
     while (running)
     {
-        if (poll(fds, 2, -1) < 0)
+        // While the power key is down, wake up in time for the hold.
+        int timeout = -1;
+        if (power_down_ms >= 0)
+        {
+            long long left = power_down_ms + POWEROFF_HOLD_MS - now_ms();
+            if (left <= 0)
+            {
+                power_down_ms = -1;
+                power_off();
+                continue;
+            }
+            timeout = (int)left;
+        }
+        if (poll(fds, system_fd >= 0 ? 3 : 2, timeout) < 0)
         {
             if (errno == EINTR)
                 continue;
@@ -327,12 +506,19 @@ int main(void)
             handle_gamepad_event();
         if (fds[1].revents & POLLIN)
             handle_uinput_event();
+        if (system_fd >= 0 && (fds[2].revents & POLLIN))
+            handle_system_event();
     }
 
     ioctl(uinput_fd, UI_DEV_DESTROY);
     close(uinput_fd);
     ioctl(gamepad_fd, EVIOCGRAB, 0);
     close(gamepad_fd);
+    if (system_fd >= 0)
+    {
+        ioctl(system_fd, EVIOCGRAB, 0);
+        close(system_fd);
+    }
     if (vibra_fd >= 0)
         close(vibra_fd);
 

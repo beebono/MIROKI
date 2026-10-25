@@ -31,6 +31,7 @@
 #include <compat/strl.h>
 #include <features/features_cpu.h>
 #include <file/file_path.h>
+#include <formats/image.h>
 #include <lists/dir_list.h>
 #include <lists/string_list.h>
 #include <retro_miscellaneous.h>
@@ -76,6 +77,15 @@
 #define RAMEN_GAME_SCALE  0.75f
 #define RAMEN_GAMES_MAX   10    /* spheres drawn at once */
 #define RAMEN_MAX_SPHERES 16
+
+/* Box art, shown inside the game spheres: /data/roms/<system>/boxart/
+ * <game>.png or .jpg, centre-cropped square and resampled into one layer
+ * of a texture array, so the shader can pick a sphere's art by index. The
+ * cache holds the spheres around the selection, replacing the least
+ * recently used. */
+#define RAMEN_ART_DIR     "boxart"
+#define RAMEN_ART_SIZE    256
+#define RAMEN_ART_LAYERS  12
 
 /* Tube radius and sphere radius as a fraction of the screen side. */
 #define RAMEN_TUBE_R      0.65f
@@ -211,6 +221,17 @@ typedef struct ramen_handle
    char  meta_runtime[64];
    char  meta_last[64];
 
+   /* Box art cache: which game each layer holds, whether a file was
+    * found, and when it was last drawn. */
+   GLuint art_tex;
+   struct
+   {
+      int sys, game;
+      bool present;
+      unsigned stamp;
+   } art[RAMEN_ART_LAYERS];
+   unsigned art_stamp;
+
    float gintro;         /* seconds since the games began bursting out */
    float gintro_len;     /* when the last visible one has settled */
    float goutro;         /* seconds since they began falling out */
@@ -233,6 +254,8 @@ typedef struct ramen_handle
    GLint u_alpha;
    GLint u_mon;
    GLint u_mon_rect;
+   GLint u_art_tex;
+   GLint u_art;
 
    font_data_t *font;
    float font_size;
@@ -274,6 +297,8 @@ static const char *ramen_frag =
    "uniform float u_alpha[16];\n"
    "uniform float u_mon;\n"
    "uniform vec4 u_mon_rect;\n"
+   "uniform highp sampler2DArray u_art_tex;\n"
+   "uniform float u_art[16];\n"
    "\n"
    /* signed distance to a rounded rectangle: half-size h, corner radius r */
    "float rrect(vec2 p, vec2 h, float r) {\n"
@@ -359,6 +384,14 @@ static const char *ramen_frag =
    "    float diff = 0.55 + 0.45 * max(0.0, dot(nrm.xy, light) * 0.6 + nrm.z * 0.8);\n"
    "    vec3 base = u_colors[i] * diff;\n"
    "    base = mix(base, base * 0.55, smoothstep(0.6, 1.0, r));\n"
+   /* box art, submerged: a round vignette into the liquid's rim, lit
+    * with the body and magnified a touch toward the centre */
+   "    if (u_art[i] >= 0.0) {\n"
+   "      vec2 uv = 0.5 + (q / R) * 0.5 * (0.90 + 0.06 * r * r);\n"
+   "      vec4 art = texture(u_art_tex, vec3(uv, u_art[i]));\n"
+   "      float am = (1.0 - smoothstep(0.72, 1.0, r)) * art.a;\n"
+   "      base = mix(base, art.rgb * (0.70 + 0.40 * diff), am);\n"
+   "    }\n"
    /* specular highlight near the top */
    "    vec2 hl = (q / R) - vec2(-0.30, -0.42);\n"
    "    float sp = exp(-dot(hl, hl) * 14.0);\n"
@@ -439,6 +472,22 @@ static bool ramen_gl_init(ramen_handle_t *rm)
    rm->u_alpha    = glGetUniformLocation(rm->prog, "u_alpha");
    rm->u_mon      = glGetUniformLocation(rm->prog, "u_mon");
    rm->u_mon_rect = glGetUniformLocation(rm->prog, "u_mon_rect");
+   rm->u_art_tex  = glGetUniformLocation(rm->prog, "u_art_tex");
+   rm->u_art      = glGetUniformLocation(rm->prog, "u_art");
+
+   /* the box art array, empty until the game view asks for it */
+   glGenTextures(1, &rm->art_tex);
+   glBindTexture(GL_TEXTURE_2D_ARRAY, rm->art_tex);
+   glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, RAMEN_ART_SIZE,
+         RAMEN_ART_SIZE, RAMEN_ART_LAYERS);
+   glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+   memset(rm->art, 0, sizeof(rm->art));
+   for (ok = 0; ok < RAMEN_ART_LAYERS; ok++)
+      rm->art[ok].sys = -1;
 
    /* The vertex shader derives the fullscreen triangle from gl_VertexID,
     * but a bound VAO is still required to draw in ES 3. */
@@ -453,8 +502,11 @@ static void ramen_gl_free(ramen_handle_t *rm)
       glDeleteProgram(rm->prog);
    if (rm->vao)
       glDeleteVertexArrays(1, &rm->vao);
+   if (rm->art_tex)
+      glDeleteTextures(1, &rm->art_tex);
    rm->prog     = 0;
    rm->vao      = 0;
+   rm->art_tex  = 0;
    rm->gl_ready = false;
 }
 
@@ -560,6 +612,131 @@ static void ramen_game_title(const char *path, char *title, size_t len)
 }
 
 /* ---- wheel ----------------------------------------------------------- */
+
+/* ---- box art ----------------------------------------------------------- */
+
+/* The cache layer holding a game's art, or -1. Touches it. */
+static int ramen_art_find(ramen_handle_t *rm, int sys, int game)
+{
+   int k;
+
+   for (k = 0; k < RAMEN_ART_LAYERS; k++)
+      if (rm->art[k].sys == sys && rm->art[k].game == game)
+      {
+         rm->art[k].stamp = ++rm->art_stamp;
+         return k;
+      }
+   return -1;
+}
+
+/* Centre-crops the image square and resamples it bilinearly into an
+ * RGBA buffer of RAMEN_ART_SIZE on a side. Pixels are ARGB words. */
+static void ramen_art_resample(const struct texture_image *img,
+      uint8_t *out)
+{
+   unsigned side = MIN(img->width, img->height);
+   unsigned ox   = (img->width - side) / 2;
+   unsigned oy   = (img->height - side) / 2;
+   float step    = (float)side / (float)RAMEN_ART_SIZE;
+   unsigned x, y;
+
+   for (y = 0; y < RAMEN_ART_SIZE; y++)
+   {
+      float fy    = oy + (y + 0.5f) * step - 0.5f;
+      int y0      = (int)floorf(fy);
+      float wy    = fy - y0;
+      int y1      = MIN(y0 + 1, (int)(oy + side - 1));
+      y0          = MAX(y0, (int)oy);
+      for (x = 0; x < RAMEN_ART_SIZE; x++)
+      {
+         float fx = ox + (x + 0.5f) * step - 0.5f;
+         int x0   = (int)floorf(fx);
+         float wx = fx - x0;
+         int x1   = MIN(x0 + 1, (int)(ox + side - 1));
+         uint32_t p00, p01, p10, p11;
+         uint8_t *o = out + (y * RAMEN_ART_SIZE + x) * 4;
+         int c;
+
+         x0  = MAX(x0, (int)ox);
+         p00 = img->pixels[y0 * img->width + x0];
+         p01 = img->pixels[y0 * img->width + x1];
+         p10 = img->pixels[y1 * img->width + x0];
+         p11 = img->pixels[y1 * img->width + x1];
+         /* out is R G B A; the words are A R G B */
+         for (c = 0; c < 4; c++)
+         {
+            int sh  = (c == 3) ? 24 : 16 - 8 * c;
+            float v = ((p00 >> sh) & 0xff) * (1 - wx) * (1 - wy)
+                    + ((p01 >> sh) & 0xff) * wx * (1 - wy)
+                    + ((p10 >> sh) & 0xff) * (1 - wx) * wy
+                    + ((p11 >> sh) & 0xff) * wx * wy;
+            o[c] = (uint8_t)(v + 0.5f);
+         }
+      }
+   }
+}
+
+/* Loads a game's art into the least recently used layer. A game with no
+ * art file takes a layer too, marked absent, so it is not retried. */
+static void ramen_art_load(ramen_handle_t *rm, int sys, int game)
+{
+   static const char *exts[] = { "png", "jpg", "jpeg" };
+   const char *rom = ramen_game_path(rm, sys, game);
+   struct texture_image img;
+   char dir[PATH_MAX_LENGTH];
+   char base[256];
+   char name[300];
+   char path[PATH_MAX_LENGTH];
+   int k, lru = 0;
+   size_t e;
+
+   if (!rom)
+      return;
+   for (k = 1; k < RAMEN_ART_LAYERS; k++)
+      if (rm->art[k].stamp < rm->art[lru].stamp)
+         lru = k;
+   rm->art[lru].sys     = sys;
+   rm->art[lru].game    = game;
+   rm->art[lru].present = false;
+   rm->art[lru].stamp   = ++rm->art_stamp;
+
+   fill_pathname_join_special(path, RAMEN_ROM_DIR, ramen_systems[sys].dir,
+         sizeof(path));
+   fill_pathname_join_special(dir, path, RAMEN_ART_DIR, sizeof(dir));
+   fill_pathname_base(base, rom, sizeof(base));
+   path_remove_extension(base);
+   memset(&img, 0, sizeof(img));
+   for (e = 0; e < ARRAY_SIZE(exts); e++)
+   {
+      snprintf(name, sizeof(name), "%s.%s", base, exts[e]);
+      fill_pathname_join_special(path, dir, name, sizeof(path));
+      if (!path_is_valid(path))
+         continue;
+      if (image_texture_load(&img, path) && img.pixels
+            && img.width && img.height)
+         break;
+      image_texture_free(&img);
+      memset(&img, 0, sizeof(img));
+   }
+   if (!img.pixels)
+      return;
+
+   {
+      uint8_t *buf = (uint8_t*)malloc(RAMEN_ART_SIZE * RAMEN_ART_SIZE * 4);
+      if (buf)
+      {
+         ramen_art_resample(&img, buf);
+         glBindTexture(GL_TEXTURE_2D_ARRAY, rm->art_tex);
+         glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, lru,
+               RAMEN_ART_SIZE, RAMEN_ART_SIZE, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+               buf);
+         glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+         free(buf);
+         rm->art[lru].present = true;
+      }
+   }
+   image_texture_free(&img);
+}
 
 /* The play time and last-played date of the selected game, out of
  * RetroArch's runtime log, cached until the selection changes. */
@@ -988,7 +1165,10 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    float spheres[RAMEN_MAX_SPHERES][4];
    float colors[RAMEN_MAX_SPHERES][3];
    float alphas[RAMEN_MAX_SPHERES];
+   float arts[RAMEN_MAX_SPHERES];
    int count            = 0;
+   int want_sys         = -1;
+   int want_game        = -1;
    int selected_slot;
    float clear, launch_deg, cam_target, dt;
    float mon_rect[4];
@@ -1062,6 +1242,7 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
       memcpy(colors[count], ramen_systems[k % RAMEN_SYSTEMS].rgb,
             sizeof(colors[count]));
       alphas[count] = 1.0f;
+      arts[count]   = -1.0f;
       count++;
    }
 
@@ -1122,6 +1303,20 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
             a *= moving;
          if (a <= 0.0f)
             continue;
+         {
+            /* the game this sphere is, and its art if cached; one missing
+             * one is decoded per frame, after the draw, so the hitch is
+             * spread out rather than taken all at once */
+            int idx   = ((rm->game + i) % n + n) % n;
+            int layer = ramen_art_find(rm, rm->system, idx);
+            arts[count] = (layer >= 0 && rm->art[layer].present)
+                        ? (float)layer : -1.0f;
+            if (layer < 0 && want_game < 0)
+            {
+               want_sys  = rm->system;
+               want_game = idx;
+            }
+         }
          alphas[count]     = a;
          spheres[count][0] = deg * (float)M_PI / 180.0f;
          spheres[count][1] = RAMEN_GAME_SCALE * (i == 0 ? 1.15f : 1.0f);
@@ -1155,10 +1350,18 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
       glUniform4fv(rm->u_spheres, count, &spheres[0][0]);
       glUniform3fv(rm->u_colors, count, &colors[0][0]);
       glUniform1fv(rm->u_alpha, count, alphas);
+      glUniform1fv(rm->u_art, count, arts);
    }
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D_ARRAY, rm->art_tex);
+   glUniform1i(rm->u_art_tex, 0);
    glDrawArrays(GL_TRIANGLES, 0, 3);
+   glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
    glBindVertexArray(0);
    glUseProgram(0);
+
+   if (want_game >= 0)
+      ramen_art_load(rm, want_sys, want_game);
 
    /* Text. The font driver binds its own program and blend state. */
    if (rm->font && rm->fade > 0.0f)

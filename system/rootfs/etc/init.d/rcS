@@ -126,3 +126,13 @@ audio_init() {
     mix 'MIROKI Playback Volume' "$level"
 }
 audio_init
+
+# The backlight level miroki-inputd keeps (raw brightness, Mode + volume).
+backlight_init() {
+    b=/sys/class/backlight/backlight
+    [ -r /data/.config/backlight ] && [ -w $b/brightness ] || return 0
+    read -r v < /data/.config/backlight
+    case "$v" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$v" -ge 1 ] && [ "$v" -le "$(cat $b/max_brightness)" ] && echo "$v" > $b/brightness
+}
+backlight_init

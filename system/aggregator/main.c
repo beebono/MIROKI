@@ -17,7 +17,10 @@
 // It also owns the system keys (gpio-keys-system, grabbed so RetroArch
 // never sees them): the volume keys step softvol's "MIROKI Playback
 // Volume" through tmix and keep /data/.config/audio_level current (rcS
-// restores it); the power key and the swivel's hall switch put the device
+// restores it), and with Mode held they step the backlight instead
+// (/data/.config/backlight, the raw brightness, also restored by rcS and
+// by ramen when its screensaver wakes); the power key and the swivel's
+// hall switch put the device
 // to sleep. Sleep is suspend-to-idle: the EL3 monitor has no CPU_SUSPEND
 // yet, so "mem" is out, and the sprd DRM driver has no suspend hooks, so
 // the backlight is switched off around it by hand. Holding the power key
@@ -47,6 +50,9 @@
 #define VOLUME_FILE   "/data/.config/audio_level"
 #define VOLUME_MAX    15
 #define BACKLIGHT     "/sys/class/backlight/backlight/bl_power"
+#define BRIGHTNESS    "/sys/class/backlight/backlight/brightness"
+#define MAX_BRIGHTNESS "/sys/class/backlight/backlight/max_brightness"
+#define BRIGHTNESS_FILE "/data/.config/backlight"
 #define POWEROFF_HOLD_MS 2000
 #define POWEROFF_BUZZ_MS 250
 #define WAKE_GRACE_MS    500
@@ -64,6 +70,11 @@ static int system_fd = -1;
 static int vibra_fd = -1;
 static int uinput_fd = -1;
 static int volume = 6;
+static int mode_held;                  // the gamepad's Mode button is down
+// Backlight steps, percent of max_brightness: spaced wider at the top,
+// where a step is hard to see, than at the bottom.
+static const int bright_pct[] = { 4, 8, 13, 20, 28, 38, 50, 63, 80, 100 };
+#define BRIGHT_STEPS ((int)(sizeof(bright_pct) / sizeof(bright_pct[0])))
 static long long power_down_ms = -1;   // when the power key went down
 static long long wake_grace_until = 0; // ignore system keys until then
 
@@ -350,6 +361,70 @@ static void volume_step(int dir)
     }
 }
 
+// ---- backlight --------------------------------------------------------------
+
+static int read_int(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    int v = -1;
+
+    if (!f)
+        return -1;
+    if (fscanf(f, "%d", &v) != 1)
+        v = -1;
+    fclose(f);
+    return v;
+}
+
+static int bright_raw(int step, int max)
+{
+    int v = max * bright_pct[step] / 100;
+
+    return v < 1 ? 1 : v;
+}
+
+// One step up or down from the step nearest the saved level (or, with
+// none saved yet, the current brightness): ramen's screensaver may have
+// the screen dimmed right now, and that is not where to step from.
+static void brightness_step(int dir)
+{
+    int max = read_int(MAX_BRIGHTNESS);
+    int cur = read_int(BRIGHTNESS_FILE);
+
+    if (cur <= 0)
+        cur = read_int(BRIGHTNESS);
+    int step = 0, best = -1;
+    char val[16];
+    FILE *f;
+
+    if (max <= 0 || cur < 0)
+        return;
+    for (int i = 0; i < BRIGHT_STEPS; i++)
+    {
+        int d = abs(bright_raw(i, max) - cur);
+
+        if (best < 0 || d < best)
+        {
+            best = d;
+            step = i;
+        }
+    }
+    step += dir;
+    if (step < 0)
+        step = 0;
+    if (step >= BRIGHT_STEPS)
+        step = BRIGHT_STEPS - 1;
+    snprintf(val, sizeof(val), "%d", bright_raw(step, max));
+    write_str(BRIGHTNESS, val);
+    mkdir("/data/.config", 0755);
+    f = fopen(BRIGHTNESS_FILE, "w");
+    if (f)
+    {
+        fprintf(f, "%s\n", val);
+        fclose(f);
+    }
+}
+
 // ---- sleep and power --------------------------------------------------------
 
 static void go_to_sleep(const char *why)
@@ -418,11 +493,11 @@ static void handle_system_event(void)
             {
             case KEY_VOLUMEUP:
                 if (ev.value)
-                    volume_step(1);
+                    mode_held ? brightness_step(1) : volume_step(1);
                 break;
             case KEY_VOLUMEDOWN:
                 if (ev.value)
-                    volume_step(-1);
+                    mode_held ? brightness_step(-1) : volume_step(-1);
                 break;
             case KEY_POWER:
                 if (ev.value == 1)
@@ -452,7 +527,13 @@ static void handle_gamepad_event(void)
         if (ev.type == EV_SYN)
             emit(uinput_fd, EV_SYN, SYN_REPORT, 0);
         else if (ev.type == EV_KEY)
+        {
+            // Mode still goes to RetroArch (Hotkey Enable); held, it
+            // turns the volume keys into brightness keys here
+            if (ev.code == BTN_MODE)
+                mode_held = ev.value != 0;
             emit(uinput_fd, EV_KEY, ev.code, ev.value);
+        }
     }
 }
 

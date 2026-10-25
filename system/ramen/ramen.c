@@ -235,6 +235,7 @@ enum ramen_sound
  * backlight to this share of its maximum and paces the menu at 5 fps;
  * the first press, which RetroArch keeps for itself, brings both back. */
 #define RAMEN_BACKLIGHT_DIR  "/sys/class/backlight/backlight"
+#define RAMEN_BACKLIGHT_LEVEL "/data/.config/backlight"   /* miroki-inputd */
 #define RAMEN_SAVER_DIM_PCT  10
 #define RAMEN_SAVER_FRAME_US 200000
 
@@ -2840,8 +2841,12 @@ static void ramen_saver(ramen_handle_t *rm, bool on)
    }
    else if (!on && rm->saver)
    {
+      /* miroki-inputd's level wins: it may have changed while dimmed */
+      int want = ramen_read_int(RAMEN_BACKLIGHT_LEVEL);
+
       rm->saver = false;
-      ramen_write_int(RAMEN_BACKLIGHT_DIR "/brightness", rm->saver_brightness);
+      ramen_write_int(RAMEN_BACKLIGHT_DIR "/brightness",
+            want > 0 ? want : rm->saver_brightness);
    }
 }
 

@@ -5,6 +5,9 @@
 # Input aggregator: one virtual pad (buttons + rumble) for RetroArch.
 ::respawn:/usr/bin/miroki-inputd
 
+# The frontend: RetroArch with ramen, back again if it ever exits.
+::respawn:/usr/bin/miroki-frontend
+
 # Debug shell on the USB serial gadget (ttyACM0 on the host).
 ttyGS0::respawn:/sbin/getty -n -l /bin/sh 115200 ttyGS0 vt100
 

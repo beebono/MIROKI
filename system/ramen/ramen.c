@@ -47,6 +47,7 @@
 #include "../../tasks/task_content.h"
 #include "../../verbosity.h"
 #include "../menu_driver.h"
+#include "../../retroarch.h"
 
 #define RAMEN_FONT_PATH   "/usr/share/miroki/fonts/Audiowide-Regular.ttf"
 #define RAMEN_STATE_PATH  "/data/.config/ramen"
@@ -115,6 +116,13 @@
 #define RAMEN_SEQ_RUN     0.65f
 #define RAMEN_SEQ_TOTAL   (RAMEN_SEQ_CLEAR + RAMEN_SEQ_ANTIC + RAMEN_SEQ_RUN)
 #define RAMEN_FADE_S      0.45f
+/* Game launch: the camera dives into the monitor's glass until the bezel
+ * leaves the frame, and the picture fades out partway through the dive.
+ * Coming back from a game plays it in reverse: fade in on the glass, then
+ * pull back out to the game view. */
+#define RAMEN_LAUNCH_S    0.6f
+#define RAMEN_LAUNCH_ZOOM 2.9f
+#define RAMEN_LAUNCH_FADE 0.5f    /* the dive's progress when the fade starts */
 /* Once the sphere has parked, the games come out of it one after the
  * other: each bursts from the same point inside the sphere to its own
  * slot, the selected one first and the trailing ones staggered behind it,
@@ -170,7 +178,7 @@ enum ramen_state
    RAMEN_LAUNCHING,      /* sequence 3, seq runs 0 -> 1 */
    RAMEN_GAME,           /* the game view */
    RAMEN_RETURNING,      /* games fall out, then seq runs 1 -> 0 */
-   RAMEN_STARTING        /* fading out, then the core loads */
+   RAMEN_STARTING        /* diving into the glass, then the core loads */
 };
 
 typedef struct ramen_handle
@@ -201,6 +209,8 @@ typedef struct ramen_handle
    float cam_vel;
    float zoom;
    float fade;
+   float launch;         /* the dive into the glass, 0..1 */
+   bool  snap_cam;       /* park the camera on the next frame */
 
    /* The game view: one list per system, loaded on first entry; the
     * game wheel is the capsule queue's rotation, same spring as the big
@@ -286,7 +296,7 @@ static const char *ramen_frag =
    "out vec4 frag;\n"
    "uniform vec2 u_size;\n"
    "uniform vec2 u_pivot;\n"
-   "uniform float u_cam;\n"
+   "uniform vec2 u_cam;\n"
    "uniform float u_zoom;\n"
    "uniform float u_fade;\n"
    "uniform float u_radius;\n"
@@ -308,7 +318,7 @@ static const char *ramen_frag =
    "\n"
    "void main() {\n"
    "  float S = min(u_size.x, u_size.y);\n"
-   "  vec2 pivot_screen = u_pivot - vec2(u_cam, 0.0);\n"
+   "  vec2 pivot_screen = u_pivot - u_cam;\n"
    "  vec2 w = u_pivot + (v_px - pivot_screen) / u_zoom;\n"
    "  vec2 rel = w - u_pivot;\n"
    "  float dist = length(rel);\n"
@@ -1026,9 +1036,18 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
       rm->mon = MAX(0.0f, rm->mon - dt / RAMEN_MON_OFF_S);
 
    if (rm->state == RAMEN_STARTING)
-      rm->fade = MAX(0.0f, rm->fade - dt / RAMEN_FADE_S);
+   {
+      rm->launch = MIN(1.0f, rm->launch + dt / RAMEN_LAUNCH_S);
+      if (rm->launch >= RAMEN_LAUNCH_FADE)
+         rm->fade = MAX(0.0f, rm->fade - dt / RAMEN_FADE_S);
+   }
    else
+   {
       rm->fade = MIN(1.0f, rm->fade + dt / RAMEN_FADE_S);
+      /* back from a game: once the picture is up, pull out of the glass */
+      if (rm->launch > 0.0f && rm->fade >= 1.0f)
+         rm->launch = MAX(0.0f, rm->launch - dt / RAMEN_LAUNCH_S);
+   }
 }
 
 /* Where the launched sphere is along the tube for a point in the sequence:
@@ -1078,6 +1097,7 @@ static void ramen_start_game(ramen_handle_t *rm)
       RARCH_ERR("[ramen] launch failed\n");
       rm->state   = RAMEN_GAME;
       rm->started = false;
+      rm->launch  = 0.0f;
    }
 }
 
@@ -1172,6 +1192,8 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    int selected_slot;
    float clear, launch_deg, cam_target, dt;
    float mon_rect[4];
+   float ps[2];          /* the pivot on screen */
+   float zoomv;          /* the zoom in effect, dive included */
    bool in_sequence;
    int k;
 
@@ -1192,10 +1214,32 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    /* The camera chases the sphere: its target follows the sphere's run
     * through the tube, and it zooms out as it arrives. */
    cam_target = S * ramen_smooth((launch_deg - 60.0f) / (RAMEN_PARK_DEG - 60.0f));
+   if (rm->snap_cam)
+   {
+      rm->cam      = cam_target;
+      rm->cam_vel  = 0.0f;
+      rm->snap_cam = false;
+   }
    ramen_spring(&rm->cam, &rm->cam_vel, cam_target, RAMEN_CAM_HZ,
          RAMEN_CAM_ZETA, dt);
    rm->zoom = 1.0f - (1.0f - RAMEN_GAME_ZOOM)
             * ramen_smooth((launch_deg - 100.0f) / (RAMEN_PARK_DEG - 100.0f));
+   ps[0]  = pivot[0] - rm->cam;
+   ps[1]  = pivot[1];
+   zoomv  = rm->zoom;
+   if (rm->launch > 0.0f)
+   {
+      /* the dive: zoom about the monitor's centre until it fills the
+       * screen, blending from the game view's camera */
+      float l   = ramen_smooth(rm->launch);
+      float mcx = mon_rect[0] + mon_rect[2] * 0.5f;
+      float mcy = mon_rect[1] + mon_rect[3] * 0.5f;
+      float tx  = width * 0.5f - (mcx - pivot[0]) * RAMEN_LAUNCH_ZOOM;
+      float ty  = height * 0.5f - (mcy - pivot[1]) * RAMEN_LAUNCH_ZOOM;
+      ps[0]  += (tx - ps[0]) * l;
+      ps[1]  += (ty - ps[1]) * l;
+      zoomv  += (RAMEN_LAUNCH_ZOOM - zoomv) * l;
+   }
 
    /* The system spheres. In a sequence the selected one is driven by the
     * timeline and the neighbours retract past their edges. */
@@ -1336,8 +1380,8 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    glBindVertexArray(rm->vao);
    glUniform2f(rm->u_size, (float)width, (float)height);
    glUniform2fv(rm->u_pivot, 1, pivot);
-   glUniform1f(rm->u_cam, rm->cam);
-   glUniform1f(rm->u_zoom, rm->zoom);
+   glUniform2f(rm->u_cam, pivot[0] - ps[0], pivot[1] - ps[1]);
+   glUniform1f(rm->u_zoom, zoomv);
    glUniform1f(rm->u_fade, rm->fade);
    glUniform1f(rm->u_radius, radius);
    glUniform1f(rm->u_sphere_r, RAMEN_SPHERE_R * S);
@@ -1396,10 +1440,10 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
          unsigned ta   = (unsigned)(mon_a * alpha);
          float inset   = mon_rect[2] * RAMEN_MON_INSET;
          /* world -> screen */
-         float sx      = pivot[0] - rm->cam + (mon_rect[0] + inset * 1.6f - pivot[0]) * rm->zoom;
-         float sw      = (mon_rect[2] - inset * 3.2f) * rm->zoom;
-         float sy      = pivot[1] + (mon_rect[1] + inset * 1.8f - pivot[1]) * rm->zoom;
-         float lh      = rm->font_size * 0.55f * rm->zoom;
+         float sx      = ps[0] + (mon_rect[0] + inset * 1.6f - pivot[0]) * zoomv;
+         float sw      = (mon_rect[2] - inset * 3.2f) * zoomv;
+         float sy      = ps[1] + (mon_rect[1] + inset * 1.8f - pivot[1]) * zoomv;
+         float lh      = rm->font_size * 0.55f * zoomv;
          char title[256];
          char l1[256], l2[256];
          char line[96];
@@ -1412,17 +1456,17 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
             snprintf(title, sizeof(title), "No games in %s/%s",
                   RAMEN_ROM_DIR, ramen_systems[rm->system].dir);
          /* the title gets up to two lines; the details follow below */
-         lines = ramen_wrap_text(rm->font, title, 0.55f * rm->zoom, sw,
+         lines = ramen_wrap_text(rm->font, title, 0.55f * zoomv, sw,
                l1, l2, sizeof(l1));
          gfx_display_draw_text(rm->font, l1,
                sx, sy + lh * 0.8f, width, height,
                COLOR_ABGR(255, 235, 245, 240 * ta / 255),
-               TEXT_ALIGN_LEFT, 0.55f * rm->zoom, false, 0.0f, true);
+               TEXT_ALIGN_LEFT, 0.55f * zoomv, false, 0.0f, true);
          if (lines > 1)
             gfx_display_draw_text(rm->font, l2,
                   sx, sy + lh * 1.9f, width, height,
                   COLOR_ABGR(255, 235, 245, 240 * ta / 255),
-                  TEXT_ALIGN_LEFT, 0.55f * rm->zoom, false, 0.0f, true);
+                  TEXT_ALIGN_LEFT, 0.55f * zoomv, false, 0.0f, true);
          y = sy + lh * (lines > 1 ? 3.4f : 2.3f);
          if (path)
          {
@@ -1433,16 +1477,16 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
             gfx_display_draw_text(rm->font, line,
                   sx, y, width, height,
                   COLOR_ABGR(140, 210, 165, 220 * ta / 255),
-                  TEXT_ALIGN_LEFT, 0.42f * rm->zoom, false, 0.0f, true);
+                  TEXT_ALIGN_LEFT, 0.42f * zoomv, false, 0.0f, true);
             gfx_display_draw_text(rm->font, rm->meta_runtime,
                   sx, y + lh * 1.3f, width, height,
                   COLOR_ABGR(140, 210, 165, 220 * ta / 255),
-                  TEXT_ALIGN_LEFT, 0.42f * rm->zoom, false, 0.0f, true);
+                  TEXT_ALIGN_LEFT, 0.42f * zoomv, false, 0.0f, true);
             if (rm->meta_last[0])
                gfx_display_draw_text(rm->font, rm->meta_last,
                      sx, y + lh * 2.4f, width, height,
                      COLOR_ABGR(140, 210, 165, 220 * ta / 255),
-                     TEXT_ALIGN_LEFT, 0.42f * rm->zoom, false, 0.0f, true);
+                     TEXT_ALIGN_LEFT, 0.42f * zoomv, false, 0.0f, true);
          }
       }
    }
@@ -1558,6 +1602,8 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
          break;
 
       case RAMEN_GAME:
+         if (rm->launch > 0.0f)
+            break;
          switch (action)
          {
             /* Down and Right turn the queue clockwise,
@@ -1595,6 +1641,30 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
    return 0;
 }
 
+/* The menu coming up. After a launch that means one of two things: the
+ * game has ended and RetroArch is back to the dummy core, so fade in on
+ * the monitor's glass and pull back out to the game view; or the game is
+ * still running and the in-game menu was toggled, which for now just
+ * shows the game view again (Sequence 6 comes later). */
+static void ramen_toggle(void *data, bool on)
+{
+   ramen_handle_t *rm = (ramen_handle_t*)data;
+   bool running;
+
+   if (!rm || !on || !rm->started)
+      return;
+   running      = !retroarch_ctl(RARCH_CTL_IS_DUMMY_CORE, NULL);
+   rm->state    = RAMEN_GAME;
+   rm->started  = running;
+   rm->seq      = 1.0f;
+   rm->mon      = 1.0f;
+   rm->gintro   = 100.0f;
+   rm->goutro   = 0.0f;
+   rm->fade     = 0.0f;
+   rm->launch   = running ? 0.0f : 1.0f;
+   rm->snap_cam = true;
+}
+
 static void ramen_render_messagebox(void *data, const char *msg)
 {
    /* TODO: draw on the monitor. Until then, keep the message visible in
@@ -1612,7 +1682,7 @@ menu_ctx_driver_t menu_ctx_ramen = {
    ramen_context_reset,
    ramen_context_destroy,
    NULL,                        /* populate_entries */
-   NULL,                        /* toggle */
+   ramen_toggle,
    NULL,                        /* navigation_clear */
    NULL,                        /* navigation_decrement */
    NULL,                        /* navigation_increment */

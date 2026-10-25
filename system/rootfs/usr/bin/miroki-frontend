@@ -1,0 +1,20 @@
+#!/bin/sh
+# MIROKI frontend: RetroArch with the ramen menu, respawned by init.
+#
+# fbcon owns the panel until here. RetroArch's DRM context restores the
+# CRTC it found on every video reinit (content load and unload), which
+# would flash the console between the menu and the game. Unbind fbcon so
+# it stops drawing, and blank the framebuffer it leaves behind, so those
+# restores show black instead. Kernel messages still go to dmesg.
+for v in /sys/class/vtconsole/vtcon*; do
+    case "$(cat "$v/name" 2>/dev/null)" in
+    *"frame buffer"*) echo 0 > "$v/bind" 2>/dev/null ;;
+    esac
+done
+[ -c /dev/fb0 ] && dd if=/dev/zero of=/dev/fb0 bs=64k 2>/dev/null
+
+# RetroArch keeps its config under $HOME/.config/retroarch.
+export HOME=/data
+retroarch
+# Keep a crash loop from starving the USB shell.
+sleep 1

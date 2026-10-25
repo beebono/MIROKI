@@ -48,6 +48,12 @@
 #include "../../verbosity.h"
 #include "../menu_driver.h"
 #include "../../retroarch.h"
+#include "../../command.h"
+#include "../../core_option_manager.h"
+#include "../../runloop.h"
+#include "../../file_path_special.h"
+#include "../../input/input_driver.h"
+#include "../../input/input_remapping.h"
 
 #define RAMEN_FONT_PATH   "/usr/share/miroki/fonts/Audiowide-Regular.ttf"
 #define RAMEN_STATE_PATH  "/data/.config/ramen"
@@ -147,6 +153,45 @@
 #define RAMEN_MON_ON_S    0.40f
 #define RAMEN_MON_OFF_S   0.25f
 
+/* The in-game menu (Sequence 6): the paused frame, dimmed and desaturated
+ * under a green panel with scanlines, opened with the CRT power-on line
+ * and closed with the power-off collapse (to a line, then a dot). A page
+ * switch degausses the picture: a wobble and a colour purity swirl that
+ * decay over the effect, with the new page drawn only once it settles. */
+#define RAMEN_IG_OPEN_S    0.30f
+#define RAMEN_IG_VCLOSE_S  0.16f
+#define RAMEN_IG_HCLOSE_S  0.14f
+#define RAMEN_DEGAUSS_S    0.55f
+#define RAMEN_DEGAUSS_SHOW 0.30f   /* the page appears this far in */
+#define RAMEN_IG_BINDS     (RARCH_FIRST_CUSTOM_BIND + 8)
+
+enum ramen_ig_page
+{
+   IG_TOP = 0,
+   IG_OPTIONS,
+   IG_REMAPS,
+   IG_PAGES
+};
+
+enum ramen_ig_cmd
+{
+   IG_CMD_NONE = 0,
+   IG_CMD_RESUME,
+   IG_CMD_SAVE,
+   IG_CMD_LOAD,
+   IG_CMD_EXIT
+};
+
+enum
+{
+   IG_TOP_RESUME = 0,
+   IG_TOP_SAVE,
+   IG_TOP_LOAD,
+   IG_TOP_SETTINGS,
+   IG_TOP_EXIT,
+   IG_TOP_COUNT
+};
+
 /* Pivot corner in screen space (origin top-left, y down): the design is
  * written for the open orientation, pivot at the bottom-right. Switch these
  * if the panel comes up with the hinge elsewhere. */
@@ -178,7 +223,8 @@ enum ramen_state
    RAMEN_LAUNCHING,      /* sequence 3, seq runs 0 -> 1 */
    RAMEN_GAME,           /* the game view */
    RAMEN_RETURNING,      /* games fall out, then seq runs 1 -> 0 */
-   RAMEN_STARTING        /* diving into the glass, then the core loads */
+   RAMEN_STARTING,       /* diving into the glass, then the core loads */
+   RAMEN_INGAME          /* the in-game menu over the paused frame */
 };
 
 typedef struct ramen_handle
@@ -211,6 +257,18 @@ typedef struct ramen_handle
    float fade;
    float launch;         /* the dive into the glass, 0..1 */
    bool  snap_cam;       /* park the camera on the next frame */
+
+   /* The in-game menu: page and cursors, the raster (open vertically on
+    * the way in, collapse vertically then horizontally on the way out),
+    * the command to run once collapsed, and the degauss clock. */
+   enum ramen_ig_page ig_page;
+   int   ig_sel[IG_PAGES];
+   float ig_v;
+   float ig_h;
+   bool  ig_closing;
+   enum ramen_ig_cmd ig_cmd;
+   float ig_degauss;     /* seconds since the page switch, or -1 */
+   bool  ig_remaps_dirty;
 
    /* The game view: one list per system, loaded on first entry; the
     * game wheel is the capsule queue's rotation, same spring as the big
@@ -266,6 +324,12 @@ typedef struct ramen_handle
    GLint u_mon_rect;
    GLint u_art_tex;
    GLint u_art;
+   GLint u_game;
+   GLint u_game_rect;
+   GLint u_game_uv;
+   GLint u_ig;
+   GLint u_ig_open;
+   GLint u_degauss;
 
    font_data_t *font;
    float font_size;
@@ -309,6 +373,12 @@ static const char *ramen_frag =
    "uniform vec4 u_mon_rect;\n"
    "uniform highp sampler2DArray u_art_tex;\n"
    "uniform float u_art[16];\n"
+   "uniform sampler2D u_game;\n"
+   "uniform vec4 u_game_rect;\n"
+   "uniform vec2 u_game_uv;\n"
+   "uniform float u_ig;\n"
+   "uniform vec2 u_ig_open;\n"
+   "uniform float u_degauss;\n"
    "\n"
    /* signed distance to a rounded rectangle: half-size h, corner radius r */
    "float rrect(vec2 p, vec2 h, float r) {\n"
@@ -318,6 +388,44 @@ static const char *ramen_frag =
    "\n"
    "void main() {\n"
    "  float S = min(u_size.x, u_size.y);\n"
+   /* the in-game menu: the paused frame as seen on the monitor */
+   "  if (u_ig > 0.5) {\n"
+   "    vec2 c = v_px / u_size * 2.0 - 1.0;\n"
+   "    vec2 p = v_px;\n"
+   "    float dg = u_degauss;\n"
+   "    float env = dg >= 0.0 ? exp(-dg * 6.0) : 0.0;\n"
+   /* degauss: the geometry wobbles, hardest at the start */
+   "    p.x += env * 0.035 * S * sin(c.y * 7.0 - dg * 38.0);\n"
+   "    p.y += env * 0.015 * S * sin(c.x * 5.0 + dg * 31.0);\n"
+   "    vec2 guv = (p - u_game_rect.xy) / u_game_rect.zw;\n"
+   "    vec3 g = vec3(0.0);\n"
+   "    if (guv.x >= 0.0 && guv.x <= 1.0 && guv.y >= 0.0 && guv.y <= 1.0)\n"
+   "      g = texture(u_game, guv * u_game_uv).rgb;\n"
+   /* dim and desaturate first, then the green */
+   "    float lum = dot(g, vec3(0.299, 0.587, 0.114));\n"
+   "    g = mix(g, vec3(lum), 0.8) * 0.38;\n"
+   "    vec3 col = vec3(0.012, 0.060, 0.032) + g * vec3(0.55, 1.0, 0.70);\n"
+   "    col *= 0.82 + 0.18 * sin(v_px.y * 1.57);\n"
+   "    col *= 1.0 - 0.18 * dot(c, c);\n"
+   /* colour purity swirl: the beams land off the mask while magnetised */
+   "    if (dg >= 0.0) {\n"
+   "      float sw = exp(-dg * 5.0);\n"
+   "      float ang = atan(c.y, c.x) + dg * 7.0 + length(c) * 5.0;\n"
+   "      col += sw * 0.22 * (0.4 + lum) * vec3(sin(ang), sin(ang + 2.094), sin(ang + 4.189));\n"
+   "    }\n"
+   /* the raster: a line opening out, or collapsing to a line and a dot */
+   "    float hx = u_ig_open.x;\n"
+   "    float vy = u_ig_open.y;\n"
+   "    float inside = step(abs(c.x), hx) * step(abs(c.y), vy);\n"
+   "    float boost = 1.0 + 3.0 * (1.0 - vy) * (1.0 - vy) + 2.0 * (1.0 - hx);\n"
+   "    col = col * inside * boost;\n"
+   "    vec3 glow = vec3(0.6, 1.0, 0.75);\n"
+   "    float line = exp(-abs(v_px.y - u_size.y * 0.5) / 2.5) * step(abs(c.x), hx) * (1.0 - vy);\n"
+   "    float dot_ = exp(-length(v_px - u_size * 0.5) / (3.0 + 30.0 * hx)) * (1.0 - vy) * (1.0 - hx);\n"
+   "    col += glow * (line * 1.2 + dot_ * 1.5) * step(0.001, hx);\n"
+   "    frag = vec4(col * u_fade, 1.0);\n"
+   "    return;\n"
+   "  }\n"
    "  vec2 pivot_screen = u_pivot - u_cam;\n"
    "  vec2 w = u_pivot + (v_px - pivot_screen) / u_zoom;\n"
    "  vec2 rel = w - u_pivot;\n"
@@ -484,6 +592,12 @@ static bool ramen_gl_init(ramen_handle_t *rm)
    rm->u_mon_rect = glGetUniformLocation(rm->prog, "u_mon_rect");
    rm->u_art_tex  = glGetUniformLocation(rm->prog, "u_art_tex");
    rm->u_art      = glGetUniformLocation(rm->prog, "u_art");
+   rm->u_game     = glGetUniformLocation(rm->prog, "u_game");
+   rm->u_game_rect = glGetUniformLocation(rm->prog, "u_game_rect");
+   rm->u_game_uv  = glGetUniformLocation(rm->prog, "u_game_uv");
+   rm->u_ig       = glGetUniformLocation(rm->prog, "u_ig");
+   rm->u_ig_open  = glGetUniformLocation(rm->prog, "u_ig_open");
+   rm->u_degauss  = glGetUniformLocation(rm->prog, "u_degauss");
 
    /* the box art array, empty until the game view asks for it */
    glGenTextures(1, &rm->art_tex);
@@ -1035,6 +1149,18 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
    else
       rm->mon = MAX(0.0f, rm->mon - dt / RAMEN_MON_OFF_S);
 
+   if (rm->state == RAMEN_INGAME)
+   {
+      if (rm->ig_degauss >= 0.0f)
+         rm->ig_degauss += dt;
+      if (!rm->ig_closing)
+         rm->ig_v = MIN(1.0f, rm->ig_v + dt / RAMEN_IG_OPEN_S);
+      else if (rm->ig_v > 0.0f)
+         rm->ig_v = MAX(0.0f, rm->ig_v - dt / RAMEN_IG_VCLOSE_S);
+      else
+         rm->ig_h = MAX(0.0f, rm->ig_h - dt / RAMEN_IG_HCLOSE_S);
+   }
+
    if (rm->state == RAMEN_STARTING)
    {
       rm->launch = MIN(1.0f, rm->launch + dt / RAMEN_LAUNCH_S);
@@ -1073,6 +1199,287 @@ static float ramen_launch_angle(float seq)
 static float ramen_clearout(float seq)
 {
    return ramen_smooth(seq * RAMEN_SEQ_TOTAL / RAMEN_SEQ_CLEAR);
+}
+
+/* ---- the in-game menu ------------------------------------------------ */
+
+static core_option_manager_t *ramen_ig_options(void)
+{
+   runloop_state_t *rs = runloop_state_get_ptr();
+   return rs ? rs->core_options : NULL;
+}
+
+/* The core option behind a Core Settings row (row 0 is Control Remaps),
+ * skipping the ones the core hides. -1 if there is none. */
+static int ramen_ig_option_at(int row)
+{
+   core_option_manager_t *opts = ramen_ig_options();
+   size_t i;
+   int seen = 0;
+
+   if (!opts || row <= 0)
+      return -1;
+   for (i = 0; i < opts->size; i++)
+   {
+      if (!core_option_manager_get_visible(opts, i))
+         continue;
+      if (++seen == row)
+         return (int)i;
+   }
+   return -1;
+}
+
+static int ramen_ig_count(ramen_handle_t *rm)
+{
+   switch (rm->ig_page)
+   {
+      case IG_TOP:
+         return IG_TOP_COUNT;
+      case IG_OPTIONS:
+      {
+         core_option_manager_t *opts = ramen_ig_options();
+         size_t i;
+         int n = 1;
+         if (opts)
+            for (i = 0; i < opts->size; i++)
+               if (core_option_manager_get_visible(opts, i))
+                  n++;
+         return n;
+      }
+      case IG_REMAPS:
+         return RAMEN_IG_BINDS;
+      default:
+         return 0;
+   }
+}
+
+/* What a remap target reads as: the core's own name for it when it gives
+ * one, the RetroPad name otherwise. */
+static const char *ramen_ig_remap_name(unsigned id)
+{
+   settings_t *settings = config_get_ptr();
+   rarch_system_info_t *sys = &runloop_state_get_ptr()->system;
+   unsigned port = settings ? settings->uints.input_remap_ports[0] : 0;
+   const char *desc;
+
+   if (id == RARCH_UNMAPPED)
+      return "---";
+   if (id >= RARCH_FIRST_META_KEY)
+      return "?";
+   desc = sys->input_desc_btn[port][id];
+   if (!string_is_empty(desc))
+      return desc;
+   return input_config_bind_map_get_desc(id);
+}
+
+/* Whether the core names any of its inputs; if not, nothing is skipped. */
+static bool ramen_ig_core_has_descs(void)
+{
+   settings_t *settings = config_get_ptr();
+   rarch_system_info_t *sys = &runloop_state_get_ptr()->system;
+   unsigned port = settings ? settings->uints.input_remap_ports[0] : 0;
+   unsigned i;
+
+   for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
+      if (!string_is_empty(sys->input_desc_btn[port][i]))
+         return true;
+   return false;
+}
+
+static void ramen_ig_save_remaps(ramen_handle_t *rm)
+{
+   settings_t *settings = config_get_ptr();
+   const char *core     = runloop_state_get_ptr()->system.info.library_name;
+   char dir[PATH_MAX_LENGTH];
+   char path[PATH_MAX_LENGTH];
+
+   if (!rm->ig_remaps_dirty || !settings || string_is_empty(core))
+      return;
+   rm->ig_remaps_dirty = false;
+   fill_pathname_join_special(dir, settings->paths.directory_input_remapping,
+         core, sizeof(dir));
+   if (!path_is_directory(dir))
+      path_mkdir(dir);
+   fill_pathname_join_special_ext(path,
+         settings->paths.directory_input_remapping, core, core,
+         FILE_PATH_REMAP_EXTENSION, sizeof(path));
+   if (input_remapping_save_file(path))
+      RARCH_LOG("[ramen] remaps saved to %s\n", path);
+   else
+      RARCH_WARN("[ramen] saving remaps to %s failed\n", path);
+}
+
+static void ramen_ig_goto(ramen_handle_t *rm, enum ramen_ig_page page)
+{
+   if (rm->ig_page == IG_REMAPS)
+      ramen_ig_save_remaps(rm);
+   rm->ig_page    = page;
+   rm->ig_degauss = 0.0f;
+   /* TODO: the degauss thunk and hum */
+}
+
+static void ramen_ig_close(ramen_handle_t *rm, enum ramen_ig_cmd cmd)
+{
+   if (rm->ig_page == IG_REMAPS)
+      ramen_ig_save_remaps(rm);
+   rm->ig_closing = true;
+   rm->ig_cmd     = cmd;
+}
+
+/* Left/Right on a row: the state slot, a core option, or a remap. */
+static void ramen_ig_adjust(ramen_handle_t *rm, int dir)
+{
+   settings_t *settings = config_get_ptr();
+   int sel = rm->ig_sel[rm->ig_page];
+
+   switch (rm->ig_page)
+   {
+      case IG_TOP:
+         if ((sel == IG_TOP_SAVE || sel == IG_TOP_LOAD) && settings)
+         {
+            int slot = settings->ints.state_slot + dir;
+            settings->ints.state_slot = MAX(0, MIN(99, slot));
+         }
+         break;
+      case IG_OPTIONS:
+      {
+         int idx = ramen_ig_option_at(sel);
+         if (idx >= 0)
+            core_option_manager_adjust_val(ramen_ig_options(), (size_t)idx,
+                  dir, false);
+         break;
+      }
+      case IG_REMAPS:
+      {
+         /* cycle through the bind order, with unmapped at the end,
+          * skipping inputs the core does not use */
+         unsigned *ids = settings->uints.input_remap_ids[0];
+         unsigned cur  = ids[sel];
+         bool has_descs = ramen_ig_core_has_descs();
+         int pos = RAMEN_IG_BINDS, i, tries;
+         for (i = 0; i < RAMEN_IG_BINDS; i++)
+            if (input_config_bind_order[i] == cur)
+            {
+               pos = i;
+               break;
+            }
+         for (tries = 0; tries <= RAMEN_IG_BINDS; tries++)
+         {
+            pos = (pos + dir + RAMEN_IG_BINDS + 1) % (RAMEN_IG_BINDS + 1);
+            if (pos == RAMEN_IG_BINDS)
+               break;
+            if (!has_descs || input_config_bind_order[pos] >= RARCH_FIRST_CUSTOM_BIND
+                  || !string_is_empty(runloop_state_get_ptr()->system
+                     .input_desc_btn[settings->uints.input_remap_ports[0]]
+                     [input_config_bind_order[pos]]))
+               break;
+         }
+         ids[sel] = (pos == RAMEN_IG_BINDS) ? RARCH_UNMAPPED
+                  : input_config_bind_order[pos];
+         rm->ig_remaps_dirty = true;
+         break;
+      }
+      default:
+         break;
+   }
+}
+
+static void ramen_ig_activate(ramen_handle_t *rm)
+{
+   int sel = rm->ig_sel[rm->ig_page];
+
+   switch (rm->ig_page)
+   {
+      case IG_TOP:
+         switch (sel)
+         {
+            case IG_TOP_RESUME:   ramen_ig_close(rm, IG_CMD_RESUME); break;
+            case IG_TOP_SAVE:     ramen_ig_close(rm, IG_CMD_SAVE);   break;
+            case IG_TOP_LOAD:     ramen_ig_close(rm, IG_CMD_LOAD);   break;
+            case IG_TOP_SETTINGS: ramen_ig_goto(rm, IG_OPTIONS);     break;
+            case IG_TOP_EXIT:     ramen_ig_close(rm, IG_CMD_EXIT);   break;
+         }
+         break;
+      case IG_OPTIONS:
+         if (sel == 0)
+            ramen_ig_goto(rm, IG_REMAPS);
+         else
+            ramen_ig_adjust(rm, 1);
+         break;
+      case IG_REMAPS:
+         ramen_ig_adjust(rm, 1);
+         break;
+      default:
+         break;
+   }
+}
+
+/* A row's label and value. */
+static void ramen_ig_row(ramen_handle_t *rm, int row, char *label,
+      size_t llen, char *value, size_t vlen)
+{
+   settings_t *settings = config_get_ptr();
+
+   label[0] = value[0] = '\0';
+   switch (rm->ig_page)
+   {
+      case IG_TOP:
+         switch (row)
+         {
+            case IG_TOP_RESUME:   strlcpy(label, "Resume Game", llen); break;
+            case IG_TOP_SAVE:     strlcpy(label, "Save State", llen);  break;
+            case IG_TOP_LOAD:     strlcpy(label, "Load State", llen);  break;
+            case IG_TOP_SETTINGS: strlcpy(label, "Core Settings", llen); break;
+            case IG_TOP_EXIT:     strlcpy(label, "Exit Game", llen);   break;
+         }
+         if ((row == IG_TOP_SAVE || row == IG_TOP_LOAD) && settings)
+            snprintf(value, vlen, "Slot %d", settings->ints.state_slot);
+         break;
+      case IG_OPTIONS:
+         if (row == 0)
+            strlcpy(label, "Control Remaps", llen);
+         else
+         {
+            int idx = ramen_ig_option_at(row);
+            core_option_manager_t *opts = ramen_ig_options();
+            const char *d, *v;
+            if (idx < 0 || !opts)
+               break;
+            d = core_option_manager_get_desc(opts, (size_t)idx, false);
+            v = core_option_manager_get_val_label(opts, (size_t)idx);
+            strlcpy(label, d ? d : "?", llen);
+            strlcpy(value, v ? v : "", vlen);
+         }
+         break;
+      case IG_REMAPS:
+         if (settings && row < RAMEN_IG_BINDS)
+         {
+            strlcpy(label, input_config_bind_map_get_desc((unsigned)row), llen);
+            strlcpy(value, ramen_ig_remap_name(
+                     settings->uints.input_remap_ids[0][row]), vlen);
+         }
+         break;
+      default:
+         break;
+   }
+}
+
+static const char *ramen_ig_title(ramen_handle_t *rm, char *buf, size_t len)
+{
+   const char *path;
+
+   switch (rm->ig_page)
+   {
+      case IG_OPTIONS: return "Core Settings";
+      case IG_REMAPS:  return "Control Remaps";
+      default: break;
+   }
+   path = ramen_game_path(rm, rm->system, rm->game);
+   if (path)
+      ramen_game_title(path, buf, len);
+   else
+      strlcpy(buf, "Paused", len);
+   return buf;
 }
 
 /* ---- launching a game ------------------------------------------------ */
@@ -1119,6 +1526,8 @@ static void *ramen_init(void **userdata, bool video_is_threaded)
    rm->zoom  = 1.0f;
    rm->fade  = 1.0f;
    rm->meta_sys = rm->meta_game = -1;
+   rm->ig_degauss = -1.0f;
+   rm->ig_h       = 1.0f;
    ramen_begin_boot_spin(rm, ramen_load_last_system());
    return menu;
 }
@@ -1399,8 +1808,40 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    glActiveTexture(GL_TEXTURE0);
    glBindTexture(GL_TEXTURE_2D_ARRAY, rm->art_tex);
    glUniform1i(rm->u_art_tex, 0);
+   /* the in-game menu samples the paused frame straight out of gl2 */
+   glUniform1f(rm->u_ig, rm->state == RAMEN_INGAME ? 1.0f : 0.0f);
+   glUniform2f(rm->u_ig_open, rm->ig_h, ramen_smooth(rm->ig_v));
+   glUniform1f(rm->u_degauss,
+         (rm->ig_degauss >= 0.0f && rm->ig_degauss < RAMEN_DEGAUSS_S)
+         ? rm->ig_degauss : -1.0f);
+   if (rm->state == RAMEN_INGAME)
+   {
+      gl2_t *gl = (gl2_t*)video_driver_get_ptr();
+      GLuint tex = 0;
+      if (gl)
+      {
+         unsigned ti = gl->tex_index;
+         tex = gl->texture[ti];
+         glUniform4f(rm->u_game_rect, (float)gl->vp.x,
+               (float)height - (float)(gl->vp.y + (int)gl->vp.height),
+               (float)gl->vp.width, (float)gl->vp.height);
+         glUniform2f(rm->u_game_uv,
+               gl->tex_w ? (float)gl->last_width[ti] / (float)gl->tex_w : 1.0f,
+               gl->tex_h ? (float)gl->last_height[ti] / (float)gl->tex_h : 1.0f);
+      }
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, tex);
+      glUniform1i(rm->u_game, 1);
+      glActiveTexture(GL_TEXTURE0);
+   }
    glDrawArrays(GL_TRIANGLES, 0, 3);
    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+   if (rm->state == RAMEN_INGAME)
+   {
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, 0);
+      glActiveTexture(GL_TEXTURE0);
+   }
    glBindVertexArray(0);
    glUseProgram(0);
 
@@ -1428,6 +1869,73 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
                cx, cy + rise + rm->font_size * 0.35f, width, height,
                COLOR_ABGR(255, 255, 255, (unsigned)(ease * alpha)),
                TEXT_ALIGN_CENTER, 1.0f, false, 0.0f, true);
+      }
+      else if (rm->state == RAMEN_INGAME)
+      {
+         /* The page, once the raster is open and the degauss has settled:
+          * a title, then rows with the label left and the value right,
+          * scrolled to keep the cursor in view. */
+         bool show = rm->ig_v >= 0.97f && !rm->ig_closing
+            && !(rm->ig_degauss >= 0.0f && rm->ig_degauss < RAMEN_DEGAUSS_SHOW);
+         if (show)
+         {
+            char tbuf[256], label[256], value[256];
+            const char *title = ramen_ig_title(rm, tbuf, sizeof(tbuf));
+            float sc   = 0.5f;
+            float lh   = rm->font_size * sc * 1.5f;
+            float x0   = width * 0.10f;
+            float x1   = width * 0.90f;
+            float y    = height * 0.13f;
+            int n      = ramen_ig_count(rm);
+            int sel    = rm->ig_sel[rm->ig_page];
+            int rows   = (int)((height * 0.88f - (y + lh * 1.6f)) / lh);
+            int first  = 0, r;
+
+            if (rows < 1)
+               rows = 1;
+            if (n > rows)
+               first = MAX(0, MIN(sel - rows / 2, n - rows));
+            strlcpy(tbuf, title, sizeof(tbuf));
+            if (title != tbuf)
+               strlcpy(tbuf, title, sizeof(tbuf));
+            ramen_fit_text(rm->font, tbuf, 0.6f, x1 - x0);
+            gfx_display_draw_text(rm->font, tbuf, x0, y, width, height,
+                  COLOR_ABGR(225, 255, 235, 255), TEXT_ALIGN_LEFT, 0.6f,
+                  false, 0.0f, true);
+            y += lh * 1.6f;
+            for (r = first; r < n && r < first + rows; r++)
+            {
+               bool cur = (r == sel);
+               uint32_t lc = cur ? COLOR_ABGR(240, 255, 245, 255)
+                                 : COLOR_ABGR(130, 205, 160, 230);
+               uint32_t vc = cur ? COLOR_ABGR(200, 255, 220, 255)
+                                 : COLOR_ABGR(110, 180, 140, 220);
+               float lw;
+
+               ramen_ig_row(rm, r, label, sizeof(label), value, sizeof(value));
+               lw = value[0] ? (x1 - x0) * 0.58f : (x1 - x0);
+               ramen_fit_text(rm->font, label, sc, lw - rm->font_size * sc);
+               if (cur)
+                  gfx_display_draw_text(rm->font, ">", x0 - rm->font_size * sc * 0.9f,
+                        y, width, height, lc, TEXT_ALIGN_LEFT, sc, false, 0.0f, true);
+               gfx_display_draw_text(rm->font, label, x0, y, width, height,
+                     lc, TEXT_ALIGN_LEFT, sc, false, 0.0f, true);
+               if (value[0])
+               {
+                  ramen_fit_text(rm->font, value, sc, (x1 - x0) * 0.40f);
+                  gfx_display_draw_text(rm->font, value, x1, y, width, height,
+                        vc, TEXT_ALIGN_RIGHT, sc, false, 0.0f, true);
+               }
+               y += lh;
+            }
+            if (n > rows)
+            {
+               snprintf(label, sizeof(label), "%d / %d", sel + 1, n);
+               gfx_display_draw_text(rm->font, label, x1, height * 0.94f,
+                     width, height, COLOR_ABGR(110, 180, 140, 200),
+                     TEXT_ALIGN_RIGHT, 0.4f, false, 0.0f, true);
+            }
+         }
       }
       else if ((rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING
                || rm->state == RAMEN_RETURNING) && rm->mon > 0.85f)
@@ -1510,6 +2018,32 @@ static void ramen_render(void *data, unsigned width, unsigned height,
    {
       rm->started = true;
       ramen_start_game(rm);
+   }
+   /* The in-game menu has collapsed: do what was picked. Resuming closes
+    * the menu; unloading the core brings it back through toggle(). */
+   if (rm->state == RAMEN_INGAME && rm->ig_closing && rm->ig_h <= 0.0f
+         && rm->ig_cmd != IG_CMD_NONE)
+   {
+      enum ramen_ig_cmd cmd = rm->ig_cmd;
+      rm->ig_cmd = IG_CMD_NONE;
+      switch (cmd)
+      {
+         case IG_CMD_SAVE:
+            command_event(CMD_EVENT_SAVE_STATE, NULL);
+            command_event(CMD_EVENT_RESUME, NULL);
+            break;
+         case IG_CMD_LOAD:
+            command_event(CMD_EVENT_LOAD_STATE, NULL);
+            command_event(CMD_EVENT_RESUME, NULL);
+            break;
+         case IG_CMD_EXIT:
+            command_event(CMD_EVENT_UNLOAD_CORE, NULL);
+            break;
+         case IG_CMD_RESUME:
+         default:
+            command_event(CMD_EVENT_RESUME, NULL);
+            break;
+      }
    }
 }
 
@@ -1636,6 +2170,45 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
 
       case RAMEN_STARTING:
          break;
+
+      case RAMEN_INGAME:
+      {
+         int n = ramen_ig_count(rm);
+         int *sel = &rm->ig_sel[rm->ig_page];
+         /* nothing while the raster moves or the picture is degaussing */
+         if (rm->ig_closing || rm->ig_v < 1.0f
+               || (rm->ig_degauss >= 0.0f && rm->ig_degauss < RAMEN_DEGAUSS_S))
+            break;
+         if (*sel >= n)
+            *sel = n ? n - 1 : 0;
+         switch (action)
+         {
+            case MENU_ACTION_UP:
+               if (n) *sel = (*sel + n - 1) % n;
+               break;
+            case MENU_ACTION_DOWN:
+               if (n) *sel = (*sel + 1) % n;
+               break;
+            case MENU_ACTION_LEFT:
+               ramen_ig_adjust(rm, -1);
+               break;
+            case MENU_ACTION_RIGHT:
+               ramen_ig_adjust(rm, 1);
+               break;
+            case MENU_ACTION_OK:
+               ramen_ig_activate(rm);
+               break;
+            case MENU_ACTION_CANCEL:
+               if (rm->ig_page == IG_TOP)
+                  ramen_ig_close(rm, IG_CMD_RESUME);
+               else
+                  ramen_ig_goto(rm, rm->ig_page == IG_REMAPS ? IG_OPTIONS : IG_TOP);
+               break;
+            default:
+               break;
+         }
+         break;
+      }
    }
    /* Everything is handled here; the generic entry list never runs. */
    return 0;
@@ -1644,8 +2217,7 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
 /* The menu coming up. After a launch that means one of two things: the
  * game has ended and RetroArch is back to the dummy core, so fade in on
  * the monitor's glass and pull back out to the game view; or the game is
- * still running and the in-game menu was toggled, which for now just
- * shows the game view again (Sequence 6 comes later). */
+ * still running and the in-game menu was toggled. */
 static void ramen_toggle(void *data, bool on)
 {
    ramen_handle_t *rm = (ramen_handle_t*)data;
@@ -1654,15 +2226,32 @@ static void ramen_toggle(void *data, bool on)
    if (!rm || !on || !rm->started)
       return;
    running      = !retroarch_ctl(RARCH_CTL_IS_DUMMY_CORE, NULL);
-   rm->state    = RAMEN_GAME;
    rm->started  = running;
    rm->seq      = 1.0f;
    rm->mon      = 1.0f;
    rm->gintro   = 100.0f;
    rm->goutro   = 0.0f;
-   rm->fade     = 0.0f;
-   rm->launch   = running ? 0.0f : 1.0f;
    rm->snap_cam = true;
+   if (running)
+   {
+      /* the in-game menu, powering on over the paused frame */
+      rm->state      = RAMEN_INGAME;
+      rm->ig_page    = IG_TOP;
+      memset(rm->ig_sel, 0, sizeof(rm->ig_sel));
+      rm->ig_v       = 0.0f;
+      rm->ig_h       = 1.0f;
+      rm->ig_closing = false;
+      rm->ig_cmd     = IG_CMD_NONE;
+      rm->ig_degauss = -1.0f;
+      rm->fade       = 1.0f;
+      rm->launch     = 0.0f;
+   }
+   else
+   {
+      rm->state  = RAMEN_GAME;
+      rm->fade   = 0.0f;
+      rm->launch = 1.0f;
+   }
 }
 
 static void ramen_render_messagebox(void *data, const char *msg)

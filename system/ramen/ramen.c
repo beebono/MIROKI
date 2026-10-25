@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <compat/strl.h>
 #include <features/features_cpu.h>
@@ -41,6 +42,7 @@
 #include "../../gfx/font_driver.h"
 #include "../../gfx/gfx_display.h"
 #include "../../gfx/video_driver.h"
+#include "../../runtime_file.h"
 #include "../../tasks/task_content.h"
 #include "../../verbosity.h"
 #include "../menu_driver.h"
@@ -103,12 +105,29 @@
 #define RAMEN_SEQ_RUN     0.65f
 #define RAMEN_SEQ_TOTAL   (RAMEN_SEQ_CLEAR + RAMEN_SEQ_ANTIC + RAMEN_SEQ_RUN)
 #define RAMEN_FADE_S      0.45f
-/* Once the sphere has parked, the games come out of it: how long, and
- * from how far inside. The offset exceeds the visible arc so that even
- * the farthest trailing sphere starts inside and the list fills from the
- * burst alone. */
-#define RAMEN_INTRO_S     0.5f
-#define RAMEN_INTRO_DEG   100.0f
+/* Once the sphere has parked, the games come out of it one after the
+ * other: each bursts from the same point inside the sphere to its own
+ * slot, the selected one first and the trailing ones staggered behind it,
+ * so the list fills from the sphere down to the bottom edge. On the way
+ * back they fall out of the bottom of the tube, accelerating, and nothing
+ * follows them. */
+#define RAMEN_INTRO_START   (RAMEN_PARK_DEG - 15.0f)
+#define RAMEN_INTRO_BURST   0.35f
+#define RAMEN_INTRO_STAGGER 0.08f
+#define RAMEN_OUTRO_S       0.45f
+#define RAMEN_OUTRO_DEG     90.0f
+
+/* The monitor, in world space relative to the pivot and in units of S: it
+ * sits in the upper right of the game view, clear of the tube's quadrant,
+ * and pans in with the camera. Power-on is the CRT line opening out;
+ * power-off collapses it again. */
+#define RAMEN_MON_X       0.48f
+#define RAMEN_MON_Y       1.13f    /* top edge, measured up from the pivot */
+#define RAMEN_MON_W       0.64f
+#define RAMEN_MON_H       0.49f
+#define RAMEN_MON_INSET   0.075f   /* bezel width as a fraction of MON_W */
+#define RAMEN_MON_ON_S    0.40f
+#define RAMEN_MON_OFF_S   0.25f
 
 /* Pivot corner in screen space (origin top-left, y down): the design is
  * written for the open orientation, pivot at the bottom-right. Switch these
@@ -140,7 +159,7 @@ enum ramen_state
    RAMEN_SYSTEM = 0,     /* the carousel */
    RAMEN_LAUNCHING,      /* sequence 3, seq runs 0 -> 1 */
    RAMEN_GAME,           /* the game view */
-   RAMEN_RETURNING,      /* sequence 3 backwards, seq runs 1 -> 0 */
+   RAMEN_RETURNING,      /* games fall out, then seq runs 1 -> 0 */
    RAMEN_STARTING        /* fading out, then the core loads */
 };
 
@@ -184,7 +203,17 @@ typedef struct ramen_handle
    float gwheel_vel;
    float gwheel_target;
    bool  gsettled;
-   float gintro;         /* games surfacing out of the parked sphere, 0..1 */
+   /* The monitor's power, 0..1, and the metadata it shows for the
+    * selected game, refreshed when the selection changes. */
+   float mon;
+   int   meta_sys;
+   int   meta_game;
+   char  meta_runtime[64];
+   char  meta_last[64];
+
+   float gintro;         /* seconds since the games began bursting out */
+   float gintro_len;     /* when the last visible one has settled */
+   float goutro;         /* seconds since they began falling out */
    bool  started;        /* RAMEN_STARTING: the load task was pushed */
 
    /* GL */
@@ -202,6 +231,8 @@ typedef struct ramen_handle
    GLint u_spheres;
    GLint u_colors;
    GLint u_alpha;
+   GLint u_mon;
+   GLint u_mon_rect;
 
    font_data_t *font;
    float font_size;
@@ -241,6 +272,14 @@ static const char *ramen_frag =
    "uniform vec4 u_spheres[16];\n"
    "uniform vec3 u_colors[16];\n"
    "uniform float u_alpha[16];\n"
+   "uniform float u_mon;\n"
+   "uniform vec4 u_mon_rect;\n"
+   "\n"
+   /* signed distance to a rounded rectangle: half-size h, corner radius r */
+   "float rrect(vec2 p, vec2 h, float r) {\n"
+   "  vec2 q = abs(p) - h + r;\n"
+   "  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;\n"
+   "}\n"
    "\n"
    "void main() {\n"
    "  float S = min(u_size.x, u_size.y);\n"
@@ -251,16 +290,51 @@ static const char *ramen_frag =
    "  vec3 col = vec3(0.035, 0.040, 0.055);\n"
    "  col += vec3(0.02) * (1.0 - clamp(dist / S, 0.0, 1.0));\n"
    "\n"
-   /* glass tube: a translucent band with an inner specular stripe */
-   "  float tube_w = u_sphere_r * 1.35;\n"
-   "  float d = abs(dist - u_radius);\n"
-   "  float body = 1.0 - smoothstep(tube_w - 1.5, tube_w + 1.5, d);\n"
-   "  float rim  = smoothstep(tube_w - 3.0, tube_w, d) * body;\n"
-   "  float spec = exp(-pow((dist - (u_radius - tube_w * 0.55)) / (tube_w * 0.10), 2.0));\n"
-   "  vec3 glass = vec3(0.55, 0.70, 0.85);\n"
-   "  col = mix(col, glass, body * 0.06);\n"
-   "  col += glass * rim * 0.35;\n"
-   "  col += vec3(1.0) * spec * 0.25 * body;\n"
+   /* the industrial monitor, behind everything: a riveted bezel around a
+    * colour CRT */
+   "  {\n"
+   "    vec2 hb = u_mon_rect.zw * 0.5;\n"
+   "    vec2 mc = u_mon_rect.xy + hb;\n"
+   "    vec2 mp = w - mc;\n"
+   "    float inset = u_mon_rect.z * 0.075000;\n"
+   "    float bd = rrect(mp, hb, inset * 0.6);\n"
+   "    if (bd < 1.0) {\n"
+   "      float sd = rrect(mp, hb - inset, inset * 0.45);\n"
+   "      float bez = 1.0 - smoothstep(-1.0, 1.0, bd);\n"
+   "      float scr = 1.0 - smoothstep(-1.0, 1.0, sd);\n"
+   /* brushed metal: a vertical gradient, a bright outer bevel, and a dark
+    * lip where it steps down to the glass */
+   "      vec3 bcol = vec3(0.17, 0.18, 0.19) * (1.15 - 0.35 * (mp.y / hb.y + 1.0) * 0.5);\n"
+   "      bcol += vec3(0.10) * (1.0 - smoothstep(0.0, inset * 0.25, -bd));\n"
+   "      bcol *= 1.0 - 0.55 * (1.0 - smoothstep(0.0, inset * 0.4, sd));\n"
+   /* four hex-headed rivets in the corners */
+   "      vec2 rp = abs(mp) - (hb - inset * 0.5);\n"
+   "      float rr = inset * 0.20;\n"
+   "      float rd = length(rp) - rr;\n"
+   "      float riv = 1.0 - smoothstep(-1.0, 1.0, rd);\n"
+   "      vec3 rcol = vec3(0.30, 0.31, 0.33) * (1.0 - 0.6 * smoothstep(0.0, rr, length(rp + vec2(rr * 0.4))));\n"
+   "      rcol = mix(rcol, vec3(0.12), smoothstep(rr * 0.75, rr * 0.9, length(rp)));\n"
+   "      bcol = mix(bcol, rcol, riv);\n"
+   "      col = mix(col, bcol, bez);\n"
+   /* the tube: barrel-distorted picture, dark green phosphor, scanlines,
+    * a vignette, and the power-on line opening out */
+   "      vec2 hs = hb - inset;\n"
+   "      vec2 su = mp / hs;\n"
+   "      su *= 1.0 + 0.07 * dot(su, su);\n"
+   "      float open = u_mon;\n"
+   "      float inside = step(abs(su.x), 1.0) * step(abs(su.y), open);\n"
+   "      vec3 pcol = vec3(0.020, 0.095, 0.050);\n"
+   "      pcol *= 1.0 - 0.45 * dot(su, su) * 0.5;\n"
+   "      pcol *= 0.80 + 0.20 * sin(su.y * hs.y * 1.3);\n"
+   "      pcol *= 1.0 + 4.0 * (1.0 - open) * (1.0 - open);\n"
+   "      float line = exp(-abs(su.y) * hs.y / 2.5) * (1.0 - open) * step(0.001, open);\n"
+   "      pcol += vec3(0.6, 1.0, 0.75) * line * 1.5;\n"
+   "      vec3 gcol = vec3(0.010, 0.018, 0.014) + pcol * inside;\n"
+   /* soft reflection on the glass, up and to the left */
+   "      gcol += vec3(0.07, 0.08, 0.09) * (1.0 - smoothstep(0.0, 1.3, length(su - vec2(-0.7, -0.8))));\n"
+   "      col = mix(col, gcol, scr);\n"
+   "    }\n"
+   "  }\n"
    "\n"
    /* spheres */
    "  for (int i = 0; i < u_count; i++) {\n"
@@ -293,6 +367,18 @@ static const char *ramen_frag =
    "    float alpha = edge * (0.82 + 0.18 * z) * (1.0 - min(stretch, 1.5) * 0.4) * u_alpha[i];\n"
    "    col = mix(col, base, alpha);\n"
    "  }\n"
+   /* glass tube, over the spheres so it reads as holding them: a translucent
+    * band with an inner specular stripe */
+   "  float tube_w = u_sphere_r * 1.35;\n"
+   "  float d = abs(dist - u_radius);\n"
+   "  float body = 1.0 - smoothstep(tube_w - 1.5, tube_w + 1.5, d);\n"
+   "  float rim  = smoothstep(tube_w - 3.0, tube_w, d) * body;\n"
+   "  float spec = exp(-pow((dist - (u_radius - tube_w * 0.55)) / (tube_w * 0.10), 2.0));\n"
+   "  vec3 glass = vec3(0.55, 0.70, 0.85);\n"
+   "  col = mix(col, glass, body * 0.06);\n"
+   "  col += glass * rim * 0.35;\n"
+   "  col += vec3(1.0) * spec * 0.25 * body;\n"
+   "\n"
    "  frag = vec4(col * u_fade, 1.0);\n"
    "}\n";
 
@@ -351,6 +437,8 @@ static bool ramen_gl_init(ramen_handle_t *rm)
    rm->u_spheres  = glGetUniformLocation(rm->prog, "u_spheres");
    rm->u_colors   = glGetUniformLocation(rm->prog, "u_colors");
    rm->u_alpha    = glGetUniformLocation(rm->prog, "u_alpha");
+   rm->u_mon      = glGetUniformLocation(rm->prog, "u_mon");
+   rm->u_mon_rect = glGetUniformLocation(rm->prog, "u_mon_rect");
 
    /* The vertex shader derives the fullscreen triangle from gl_VertexID,
     * but a bound VAO is still required to draw in ES 3. */
@@ -472,6 +560,122 @@ static void ramen_game_title(const char *path, char *title, size_t len)
 }
 
 /* ---- wheel ----------------------------------------------------------- */
+
+/* The play time and last-played date of the selected game, out of
+ * RetroArch's runtime log, cached until the selection changes. */
+static void ramen_refresh_meta(ramen_handle_t *rm)
+{
+   settings_t *settings = config_get_ptr();
+   const char *rom      = ramen_game_path(rm, rm->system, rm->game);
+   runtime_log_t *log   = NULL;
+   char core[PATH_MAX_LENGTH];
+
+   if (rm->meta_sys == rm->system && rm->meta_game == rm->game)
+      return;
+   rm->meta_sys  = rm->system;
+   rm->meta_game = rm->game;
+   rm->meta_runtime[0] = rm->meta_last[0] = '\0';
+   if (!rom || !settings)
+      return;
+   fill_pathname_join_special(core, RAMEN_CORE_DIR,
+         ramen_systems[rm->system].core, sizeof(core));
+   log = runtime_log_init(rom, core,
+         settings->paths.directory_runtime_log,
+         settings->paths.directory_playlist,
+         !settings->bools.content_runtime_log_aggregate);
+   if (log && runtime_log_has_runtime(log))
+   {
+      if (log->runtime.hours)
+         snprintf(rm->meta_runtime, sizeof(rm->meta_runtime),
+               "Played %uh %02um", log->runtime.hours, log->runtime.minutes);
+      else
+         snprintf(rm->meta_runtime, sizeof(rm->meta_runtime),
+               "Played %um %02us", log->runtime.minutes,
+               log->runtime.seconds);
+      if (log->last_played.year)
+      {
+         /* Relative, in calendar days, since the clock is not something
+          * the user sets. Both ends come from the same clock, so a wrong
+          * one still gives sensible "days ago" counts across a session;
+          * an impossible age means it jumped, and nothing is shown. */
+         time_t now = time(NULL);
+         struct tm then, today;
+         long days;
+
+         memset(&then, 0, sizeof(then));
+         then.tm_year  = (int)log->last_played.year - 1900;
+         then.tm_mon   = (int)log->last_played.month - 1;
+         then.tm_mday  = (int)log->last_played.day;
+         then.tm_hour  = 12;
+         then.tm_isdst = -1;
+         today = *localtime(&now);
+         today.tm_hour = 12;
+         today.tm_min = today.tm_sec = 0;
+         days = (long)((mktime(&today) - mktime(&then)) / 86400.0 + 0.5);
+         if (days == 0)
+            strlcpy(rm->meta_last, "Last played today", sizeof(rm->meta_last));
+         else if (days == 1)
+            strlcpy(rm->meta_last, "Last played yesterday", sizeof(rm->meta_last));
+         else if (days > 1 && days < 3650)
+            snprintf(rm->meta_last, sizeof(rm->meta_last),
+                  "Last played %ld days ago", days);
+      }
+   }
+   else
+      strlcpy(rm->meta_runtime, "Never played", sizeof(rm->meta_runtime));
+   if (log)
+      free(log);
+}
+
+/* Shortens text to fit a width, in screen pixels at the given scale. */
+static void ramen_fit_text(const font_data_t *font, char *text, float scale,
+      float max_w)
+{
+   size_t len = strlen(text);
+
+   if (!font || font_driver_get_message_width((void*)font, text, len, scale)
+         <= max_w)
+      return;
+   while (len > 1)
+   {
+      len--;
+      strcpy(text + len, "...");
+      if (font_driver_get_message_width((void*)font, text, len + 3, scale)
+            <= max_w)
+         return;
+   }
+}
+
+/* Breaks text into two lines at a word boundary, the first as long as
+ * fits; the remainder is shortened to fit. Returns the line count. */
+static int ramen_wrap_text(const font_data_t *font, const char *text,
+      float scale, float max_w, char *l1, char *l2, size_t len)
+{
+   const char *best = NULL;
+   const char *p;
+
+   strlcpy(l1, text, len);
+   l2[0] = '\0';
+   if (!font || font_driver_get_message_width((void*)font, text,
+            strlen(text), scale) <= max_w)
+      return 1;
+   for (p = strchr(text, ' '); p; p = strchr(p + 1, ' '))
+   {
+      if (font_driver_get_message_width((void*)font, text,
+               (size_t)(p - text), scale) > max_w)
+         break;
+      best = p;
+   }
+   if (!best)
+   {
+      ramen_fit_text(font, l1, scale, max_w);
+      return 1;
+   }
+   strlcpy(l1, text, MIN(len, (size_t)(best - text) + 1));
+   strlcpy(l2, best + 1, len);
+   ramen_fit_text(font, l2, scale, max_w);
+   return 2;
+}
 
 static float ramen_slot_target(int slot)
 {
@@ -607,17 +811,24 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
    }
    else if (rm->state == RAMEN_RETURNING)
    {
-      rm->seq -= dt / RAMEN_SEQ_TOTAL;
-      if (rm->seq <= 0.0f)
+      /* The games fall out first; the sphere leaves once they are gone. */
+      if (rm->goutro < RAMEN_OUTRO_S)
+         rm->goutro += dt;
+      else
       {
-         rm->seq   = 0.0f;
-         rm->state = RAMEN_SYSTEM;
-         rm->settled = false;  /* lets the label resurface */
+         rm->seq -= dt / RAMEN_SEQ_TOTAL;
+         if (rm->seq <= 0.0f)
+         {
+            rm->seq   = 0.0f;
+            rm->state = RAMEN_SYSTEM;
+            rm->settled = false;  /* lets the label resurface */
+         }
       }
    }
 
-   if (rm->state == RAMEN_GAME)
-      rm->gintro = MIN(1.0f, rm->gintro + dt / RAMEN_INTRO_S);
+   if (rm->state == RAMEN_GAME || rm->state == RAMEN_RETURNING
+         || rm->state == RAMEN_STARTING)
+      rm->gintro += dt;
 
    /* The game queue's own detent spring. */
    ramen_spring(&rm->gwheel, &rm->gwheel_vel, rm->gwheel_target,
@@ -629,6 +840,13 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
       rm->gwheel     = rm->gwheel_target;
       rm->gwheel_vel = 0.0f;
    }
+
+   /* The monitor comes on once the sphere has parked and goes off as
+    * the games start falling out. */
+   if (rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING)
+      rm->mon = MIN(1.0f, rm->mon + dt / RAMEN_MON_ON_S);
+   else
+      rm->mon = MAX(0.0f, rm->mon - dt / RAMEN_MON_OFF_S);
 
    if (rm->state == RAMEN_STARTING)
       rm->fade = MAX(0.0f, rm->fade - dt / RAMEN_FADE_S);
@@ -703,6 +921,7 @@ static void *ramen_init(void **userdata, bool video_is_threaded)
    *userdata = rm;
    rm->zoom  = 1.0f;
    rm->fade  = 1.0f;
+   rm->meta_sys = rm->meta_game = -1;
    ramen_begin_boot_spin(rm, ramen_load_last_system());
    return menu;
 }
@@ -772,6 +991,7 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    int count            = 0;
    int selected_slot;
    float clear, launch_deg, cam_target, dt;
+   float mon_rect[4];
    bool in_sequence;
    int k;
 
@@ -780,6 +1000,10 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
 
    ramen_update(rm, cpu_features_get_time_usec());
    dt            = rm->dt;
+   mon_rect[0]   = pivot[0] + RAMEN_MON_X * S;
+   mon_rect[1]   = pivot[1] - RAMEN_MON_Y * S;
+   mon_rect[2]   = RAMEN_MON_W * S;
+   mon_rect[3]   = RAMEN_MON_H * S;
    selected_slot = ramen_slot_at(rm->wheel_target);
    in_sequence   = rm->state != RAMEN_SYSTEM;
    clear         = in_sequence ? ramen_clearout(rm->seq) : 0.0f;
@@ -845,27 +1069,50 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
     * drawn relative to the selection, which is bookkeeping on the side.
     * Relative index i sits at RAMEN_GAME_DEG - i * slot, so the selected
     * sphere is on the diagonal and the rest trail clockwise toward the
-    * bottom edge, the whole list coming out of the sphere together in the
-    * intro. A step turns the ring: one sphere enters from the system sphere
-    * (i = 1) while the last one (i = -n) leaves past the edge, and those
-    * two only exist while the ring is in motion. */
-   if (rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING)
+    * bottom edge. In the intro each one bursts out of the sphere to its
+    * slot in turn, the selected one first. A step turns the ring: one
+    * sphere enters from the system sphere (i = 1) while the last one
+    * (i = -n) leaves past the edge, and those two only exist while the
+    * ring is in motion. In the outro the whole ring falls out of the
+    * bottom, and nothing comes in behind it. */
+   if (rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING
+         || (rm->state == RAMEN_RETURNING && rm->goutro < RAMEN_OUTRO_S))
    {
       int n        = (int)ramen_game_count(rm, rm->system);
       int last     = MIN(n, RAMEN_GAMES_MAX);
       float offset = rm->gwheel - rm->gwheel_target;
       float moving = MIN(1.0f, fabsf(offset) / rm->gslot);
       float emerge = RAMEN_PARK_DEG + RAMEN_GAME_EMERGE;
+      bool leaving = rm->state == RAMEN_RETURNING;
+      float fall   = 0.0f;
       int i;
+
+      if (leaving)
+      {
+         /* gravity: ease-in, so it picks up speed on the way down */
+         float t = MIN(1.0f, rm->goutro / RAMEN_OUTRO_S);
+         fall    = RAMEN_OUTRO_DEG * t * t;
+      }
 
       for (i = -last; i <= 1 && count < RAMEN_MAX_SPHERES; i++)
       {
-         float deg = RAMEN_GAME_DEG + offset - i * rm->gslot
-                   - RAMEN_INTRO_DEG * (1.0f - ramen_burst(rm->gintro));
+         float rest = RAMEN_GAME_DEG + offset - i * rm->gslot;
+         float deg  = rest;
          float a;
 
          if (n <= 0)
             continue;
+         if (leaving && i == 1)
+            continue;
+         if (i <= 0)
+         {
+            /* the burst, staggered by how far down the list it sits */
+            float t = (rm->gintro + i * RAMEN_INTRO_STAGGER)
+                    / RAMEN_INTRO_BURST;
+            deg = RAMEN_INTRO_START
+                + (rest - RAMEN_INTRO_START) * ramen_burst(t);
+         }
+         deg += fall;
          if (deg < emerge || deg > RAMEN_GAME_END)
             continue;
          /* surfacing out of the sphere, sinking past the edge */
@@ -900,6 +1147,9 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    glUniform1f(rm->u_radius, radius);
    glUniform1f(rm->u_sphere_r, RAMEN_SPHERE_R * S);
    glUniform1i(rm->u_count, count);
+   glUniform1f(rm->u_mon, ramen_smooth(rm->mon));
+   glUniform4f(rm->u_mon_rect, mon_rect[0], mon_rect[1], mon_rect[2],
+         mon_rect[3]);
    if (count)
    {
       glUniform4fv(rm->u_spheres, count, &spheres[0][0]);
@@ -932,32 +1182,64 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
                COLOR_ABGR(255, 255, 255, (unsigned)(ease * alpha)),
                TEXT_ALIGN_CENTER, 1.0f, false, 0.0f, true);
       }
-      else if (rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING)
+      else if ((rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING
+               || rm->state == RAMEN_RETURNING) && rm->mon > 0.85f)
       {
-         /* Until the monitor exists, the title sits in the space it will
-          * occupy, top right. */
+         /* The monitor's picture: title, system, play time and last
+          * played, laid out in world space and projected like the rest.
+          * Text shows once the raster has opened most of the way. */
          const char *path = ramen_game_path(rm, rm->system, rm->game);
+         float mon_a   = ramen_smooth((rm->mon - 0.85f) / 0.15f);
+         unsigned ta   = (unsigned)(mon_a * alpha);
+         float inset   = mon_rect[2] * RAMEN_MON_INSET;
+         /* world -> screen */
+         float sx      = pivot[0] - rm->cam + (mon_rect[0] + inset * 1.6f - pivot[0]) * rm->zoom;
+         float sw      = (mon_rect[2] - inset * 3.2f) * rm->zoom;
+         float sy      = pivot[1] + (mon_rect[1] + inset * 1.8f - pivot[1]) * rm->zoom;
+         float lh      = rm->font_size * 0.55f * rm->zoom;
          char title[256];
-         char count_s[32];
+         char l1[256], l2[256];
+         char line[96];
+         float y;
+         int lines;
 
          if (path)
             ramen_game_title(path, title, sizeof(title));
          else
             snprintf(title, sizeof(title), "No games in %s/%s",
                   RAMEN_ROM_DIR, ramen_systems[rm->system].dir);
-         gfx_display_draw_text(rm->font, title,
-               width * 0.96f, height * 0.12f, width, height,
-               COLOR_ABGR(255, 255, 255, alpha),
-               TEXT_ALIGN_RIGHT, 0.8f, false, 0.0f, true);
+         /* the title gets up to two lines; the details follow below */
+         lines = ramen_wrap_text(rm->font, title, 0.55f * rm->zoom, sw,
+               l1, l2, sizeof(l1));
+         gfx_display_draw_text(rm->font, l1,
+               sx, sy + lh * 0.8f, width, height,
+               COLOR_ABGR(255, 235, 245, 240 * ta / 255),
+               TEXT_ALIGN_LEFT, 0.55f * rm->zoom, false, 0.0f, true);
+         if (lines > 1)
+            gfx_display_draw_text(rm->font, l2,
+                  sx, sy + lh * 1.9f, width, height,
+                  COLOR_ABGR(255, 235, 245, 240 * ta / 255),
+                  TEXT_ALIGN_LEFT, 0.55f * rm->zoom, false, 0.0f, true);
+         y = sy + lh * (lines > 1 ? 3.4f : 2.3f);
          if (path)
          {
-            snprintf(count_s, sizeof(count_s), "%d / %u", rm->game + 1,
+            ramen_refresh_meta(rm);
+            snprintf(line, sizeof(line), "%s   %d / %u",
+                  ramen_systems[rm->system].name, rm->game + 1,
                   ramen_game_count(rm, rm->system));
-            gfx_display_draw_text(rm->font, count_s,
-                  width * 0.96f, height * 0.12f + rm->font_size,
-                  width, height,
-                  COLOR_ABGR(180, 200, 220, alpha),
-                  TEXT_ALIGN_RIGHT, 0.6f, false, 0.0f, true);
+            gfx_display_draw_text(rm->font, line,
+                  sx, y, width, height,
+                  COLOR_ABGR(140, 210, 165, 220 * ta / 255),
+                  TEXT_ALIGN_LEFT, 0.42f * rm->zoom, false, 0.0f, true);
+            gfx_display_draw_text(rm->font, rm->meta_runtime,
+                  sx, y + lh * 1.3f, width, height,
+                  COLOR_ABGR(140, 210, 165, 220 * ta / 255),
+                  TEXT_ALIGN_LEFT, 0.42f * rm->zoom, false, 0.0f, true);
+            if (rm->meta_last[0])
+               gfx_display_draw_text(rm->font, rm->meta_last,
+                     sx, y + lh * 2.4f, width, height,
+                     COLOR_ABGR(140, 210, 165, 220 * ta / 255),
+                     TEXT_ALIGN_LEFT, 0.42f * rm->zoom, false, 0.0f, true);
          }
       }
    }
@@ -1020,15 +1302,15 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
       case RAMEN_SYSTEM:
          switch (action)
          {
-            /* Down and Right turn the wheel clockwise, Up and Left the
+            /* Down and LEFT turn the wheel clockwise, Up and RIGHT the
              * other way: matching the rotation to the press felt better
              * than matching the sphere's travel. */
+            case MENU_ACTION_DOWN:
             case MENU_ACTION_LEFT:
-            case MENU_ACTION_UP:
                ramen_step(rm, -1);
                break;
+            case MENU_ACTION_UP:
             case MENU_ACTION_RIGHT:
-            case MENU_ACTION_DOWN:
                ramen_step(rm, 1);
                break;
             case MENU_ACTION_OK:
@@ -1045,6 +1327,16 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
                rm->gslot = ramen_game_slot(ramen_game_count(rm, rm->system));
                if ((unsigned)rm->game >= ramen_game_count(rm, rm->system))
                   rm->game = 0;
+               /* the intro lasts until the last sphere that can be seen,
+                * the one nearest the bottom edge, has settled */
+               {
+                  int vis = (int)((RAMEN_GAME_END - RAMEN_GAME_DEG)
+                                  / rm->gslot) + 1;
+                  int n   = (int)ramen_game_count(rm, rm->system);
+                  vis = MIN(vis, MIN(n, RAMEN_GAMES_MAX));
+                  rm->gintro_len = RAMEN_INTRO_BURST
+                     + (vis > 0 ? (vis - 1) : 0) * RAMEN_INTRO_STAGGER;
+               }
                break;
             default:
                break;
@@ -1055,22 +1347,26 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
       case RAMEN_RETURNING:
          /* Let the motion finish; a press mid-way just reverses it. */
          if (action == MENU_ACTION_CANCEL && rm->state == RAMEN_LAUNCHING)
-            rm->state = RAMEN_RETURNING;
+         {
+            /* no games are out yet, so nothing to drop */
+            rm->state  = RAMEN_RETURNING;
+            rm->goutro = RAMEN_OUTRO_S;
+         }
          break;
 
       case RAMEN_GAME:
          switch (action)
          {
-            /* Same convention: Down and Right turn the queue clockwise,
+            /* Down and Right turn the queue clockwise,
              * which is forward through the list. */
             case MENU_ACTION_DOWN:
             case MENU_ACTION_RIGHT:
-               if (rm->gintro >= 1.0f)
+               if (rm->gintro >= rm->gintro_len)
                   ramen_game_step(rm, 1);
                break;
             case MENU_ACTION_UP:
             case MENU_ACTION_LEFT:
-               if (rm->gintro >= 1.0f)
+               if (rm->gintro >= rm->gintro_len)
                   ramen_game_step(rm, -1);
                break;
             case MENU_ACTION_OK:
@@ -1081,7 +1377,8 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
                }
                break;
             case MENU_ACTION_CANCEL:
-               rm->state = RAMEN_RETURNING;
+               rm->state  = RAMEN_RETURNING;
+               rm->goutro = 0.0f;
                break;
             default:
                break;

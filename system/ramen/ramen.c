@@ -411,7 +411,7 @@ static const char *ramen_frag =
    "    if (dg >= 0.0) {\n"
    "      float sw = exp(-dg * 5.0);\n"
    "      float ang = atan(c.y, c.x) + dg * 7.0 + length(c) * 5.0;\n"
-   "      col += sw * 0.22 * (0.4 + lum) * vec3(sin(ang), sin(ang + 2.094), sin(ang + 4.189));\n"
+   "      col += sw * 0.09 * (0.4 + lum) * vec3(sin(ang), sin(ang + 2.094), sin(ang + 4.189));\n"
    "    }\n"
    /* the raster: a line opening out, or collapsing to a line and a dot */
    "    float hx = u_ig_open.x;\n"
@@ -1808,6 +1808,9 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    glActiveTexture(GL_TEXTURE0);
    glBindTexture(GL_TEXTURE_2D_ARRAY, rm->art_tex);
    glUniform1i(rm->u_art_tex, 0);
+   /* The game sampler lives on unit 1 even when unused: two samplers of
+    * different types on one unit make the whole draw fail. */
+   glUniform1i(rm->u_game, 1);
    /* the in-game menu samples the paused frame straight out of gl2 */
    glUniform1f(rm->u_ig, rm->state == RAMEN_INGAME ? 1.0f : 0.0f);
    glUniform2f(rm->u_ig_open, rm->ig_h, ramen_smooth(rm->ig_v));
@@ -1831,7 +1834,6 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
       }
       glActiveTexture(GL_TEXTURE1);
       glBindTexture(GL_TEXTURE_2D, tex);
-      glUniform1i(rm->u_game, 1);
       glActiveTexture(GL_TEXTURE0);
    }
    glDrawArrays(GL_TRIANGLES, 0, 3);

@@ -360,6 +360,7 @@ typedef struct ramen_handle
    GLint u_game;
    GLint u_game_rect;
    GLint u_game_uv;
+   GLint u_game_flip;
    GLint u_ig;
    GLint u_ig_open;
    GLint u_degauss;
@@ -409,6 +410,7 @@ static const char *ramen_frag =
    "uniform sampler2D u_game;\n"
    "uniform vec4 u_game_rect;\n"
    "uniform vec2 u_game_uv;\n"
+   "uniform float u_game_flip;\n"
    "uniform float u_ig;\n"
    "uniform vec2 u_ig_open;\n"
    "uniform float u_degauss;\n"
@@ -433,7 +435,7 @@ static const char *ramen_frag =
    "    vec2 guv = (p - u_game_rect.xy) / u_game_rect.zw;\n"
    "    vec3 g = vec3(0.0);\n"
    "    if (guv.x >= 0.0 && guv.x <= 1.0 && guv.y >= 0.0 && guv.y <= 1.0)\n"
-   "      g = texture(u_game, guv * u_game_uv).rgb;\n"
+   "      g = texture(u_game, vec2(guv.x, u_game_flip > 0.5 ? 1.0 - guv.y : guv.y) * u_game_uv).rgb;\n"
    "    vec3 graw = g;\n"
    /* dim and desaturate first, then the green */
    "    float lum = dot(g, vec3(0.299, 0.587, 0.114));\n"
@@ -630,6 +632,7 @@ static bool ramen_gl_init(ramen_handle_t *rm)
    rm->u_game     = glGetUniformLocation(rm->prog, "u_game");
    rm->u_game_rect = glGetUniformLocation(rm->prog, "u_game_rect");
    rm->u_game_uv  = glGetUniformLocation(rm->prog, "u_game_uv");
+   rm->u_game_flip = glGetUniformLocation(rm->prog, "u_game_flip");
    rm->u_ig       = glGetUniformLocation(rm->prog, "u_ig");
    rm->u_ig_open  = glGetUniformLocation(rm->prog, "u_ig_open");
    rm->u_degauss  = glGetUniformLocation(rm->prog, "u_degauss");
@@ -2162,6 +2165,14 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
          glUniform2f(rm->u_game_uv,
                gl->tex_w ? (float)gl->last_width[ti] / (float)gl->tex_w : 1.0f,
                gl->tex_h ? (float)gl->last_height[ti] / (float)gl->tex_h : 1.0f);
+         /* gl2 uploads software frames top row first, but a hw core
+          * renders with GL's bottom-left origin and gl2 flips it on draw */
+         {
+            struct retro_hw_render_callback *hwr = video_driver_get_hw_context();
+            glUniform1f(rm->u_game_flip, (hwr
+                     && hwr->context_type != RETRO_HW_CONTEXT_NONE
+                     && hwr->bottom_left_origin) ? 1.0f : 0.0f);
+         }
       }
       glActiveTexture(GL_TEXTURE1);
       glBindTexture(GL_TEXTURE_2D, tex);

@@ -10,6 +10,25 @@ The boot chain is a rebuilt Unisoc SPL and a small EL3 monitor of our own,
 then a mainline-based kernel and a squashfs root. The stock firmware's
 secure world and u-boot are not used.
 
+## Previews
+
+<table>
+  <tr>
+    <th width="50%">Systems</th>
+    <th width="50%">Games</th>
+  </tr>
+  <tr>
+    <td><img src="systems.png" width="100%"></td>
+    <td><img src="games.png" width="100%"></td>
+  </tr>
+  <tr>
+    <th colspan="2">In-Game Menu</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="igmenu.png" width="50%"></td>
+  </tr>
+</table>
+
 ## Building
 
 ### Host
@@ -71,6 +90,10 @@ the SPL). `JOBS=n` limits parallelism.
 
 ## Flashing
 
+***INSTALLING MIROKI WILL OBLITERATE ANDROID FROM YOUR RG ROTATE AND DOES NOT SUPPORT DUAL BOOTING!!!***
+
+***SERIOUSLY, YOU HAVE BEEN WARNED!!!***
+
 Flashing uses the BootROM's download mode and `tools/spd_dump`, with the
 device's download stubs (`fdl1-dl.bin`, `fdl2-dl.bin`) next to it. To enter
 download mode, hold the Home/Back combo button while plugging in USB; the
@@ -109,6 +132,9 @@ everything that changes: ROMs, saves, states and RetroArch's settings.
 - BIOS files go in `bios`. The Saturn core needs one of `saturn_bios.bin`,
   `sega_101.bin` or `mpr-17933.bin`; the PlayStation core has a built-in
   BIOS and can use a real one.
+- Boxart optionally goes under `roms/<system>/boxart` with each file matching
+  the name of its corresponding game, minus its extension. Accepted formats
+  are `.png` and `.jpg/.jpeg`.
 
 To copy files over, press Start in the system carousel: the device shares
 `data` with the computer as a USB drive, and takes it back when the computer

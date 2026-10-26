@@ -139,6 +139,14 @@ everything that changes: ROMs, saves, states and RetroArch's settings.
 - Boxart optionally goes under `roms/<system>/boxart` with each file matching
   the name of its corresponding game, minus its extension. Accepted formats
   are `.png` and `.jpg/.jpeg`.
+- Extra libretro cores can go in `cores`, as aarch64 Linux builds named
+  `<name>_libretro.so`. Each becomes a system that reads `roms/<name>`; with
+  a matching `<name>_libretro.info` beside it, it also reads
+  `roms/<systemid>`, the `systemid` from that file. Make those folders
+  yourself. A core named like a built-in one (`pcsx_rearmed_libretro.so`),
+  or whose name or `systemid` is `n64`, `psx` or `saturn`, replaces that
+  built-in core. Cores must render in software or through GLES, and need
+  only the libraries already on the device.
 
 To copy files over, press Start in the system carousel: the device shares
 `data` with the computer as a USB drive, and takes it back when the computer

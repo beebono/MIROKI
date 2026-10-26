@@ -27,10 +27,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include <compat/strl.h>
+#include <dynamic/dylib.h>
 #include <features/features_cpu.h>
+#include <file/config_file.h>
 #include <file/file_path.h>
 #include <formats/image.h>
 #include <lists/dir_list.h>
@@ -63,14 +66,17 @@
 #define RAMEN_STATE_PATH  "/data/.config/ramen"
 #define RAMEN_ROM_DIR     "/data/roms"
 #define RAMEN_CORE_DIR    "/usr/lib/libretro"
+#define RAMEN_USER_CORE_DIR "/data/cores"
 
-/* Carousel: 9 slots at 40 degrees holding the 3 systems three times over.
+/* Carousel: slots 40 degrees apart cycling through the systems, A B C A B C
+ * for as far as the wheel turns, so any number of systems repeats evenly.
  * The selected slot sits at 45 degrees (the screen diagonal), its neighbours
  * at 5 and 85, half clipped by the bottom and right edges. */
-#define RAMEN_SLOTS       9
 #define RAMEN_SLOT_DEG    40.0f
 #define RAMEN_SELECT_DEG  45.0f
-#define RAMEN_SYSTEMS     3
+#define RAMEN_BUILTINS    3
+#define RAMEN_SYSTEMS_MAX 32
+#define RAMEN_SYS_DIRS    3
 
 /* Game view: the circle's upper-right quadrant, 90..180 degrees. The system
  * sphere parks on its diagonal and the games are smaller spheres queued
@@ -89,8 +95,8 @@
 #define RAMEN_GAMES_MAX   10    /* spheres drawn at once */
 #define RAMEN_MAX_SPHERES 16
 
-/* Box art, shown inside the game spheres: /data/roms/<system>/boxart/
- * <game>.png or .jpg, centre-cropped square and resampled into one layer
+/* Box art, shown inside the game spheres: boxart/<game>.png or .jpg in
+ * the game's own directory, centre-cropped square and resampled into one layer
  * of a texture array, so the shader can pick a sphere's art by index. The
  * cache holds the spheres around the selection, replacing the least
  * recently used. */
@@ -269,7 +275,7 @@ static const struct
    const char *core;     /* under RAMEN_CORE_DIR */
    const char *exts;     /* dir_list_new() filter */
    float rgb[3];
-} ramen_systems[RAMEN_SYSTEMS] = {
+} ramen_builtins[RAMEN_BUILTINS] = {
    { "N64",    "n64",    "mupen64plus_pow2_libretro.so",
      "n64|v64|z64|bin|u1|ndd",
      { 0.22f, 0.60f, 0.95f } },
@@ -280,6 +286,21 @@ static const struct
      "cue|chd|iso|mds|ccd",
      { 0.95f, 0.45f, 0.20f } },
 };
+
+/* The carousel's systems: the built-ins, then the user's cores from
+ * RAMEN_USER_CORE_DIR. A user core named like a built-in's core, or whose
+ * short name is a built-in's directory, takes that built-in's place. dirs[0]
+ * is the system's key, saved as the last played. */
+typedef struct
+{
+   char name[64];
+   char dirs[RAMEN_SYS_DIRS][64];   /* under RAMEN_ROM_DIR */
+   int  ndirs;
+   char core[PATH_MAX_LENGTH];
+   char exts[512];
+   float rgb[3];
+   bool custom;
+} ramen_system_t;
 
 enum ramen_state
 {
@@ -365,11 +386,15 @@ typedef struct ramen_handle
    bool  saver;
    int   saver_brightness;
 
+   /* The systems on the carousel, built-ins first. */
+   ramen_system_t sys[RAMEN_SYSTEMS_MAX];
+   int   nsys;
+
    /* The game view: one list per system, loaded on first entry; the
     * game wheel is the capsule queue's rotation, same spring as the big
     * one. */
-   struct string_list *games[RAMEN_SYSTEMS];
-   bool games_loaded[RAMEN_SYSTEMS];
+   struct string_list *games[RAMEN_SYSTEMS_MAX];
+   bool games_loaded[RAMEN_SYSTEMS_MAX];
    int   game;           /* selected index */
    float gslot;          /* degrees between games, from the count */
    float gwheel;         /* degrees, unwrapped; grows stepping forward */
@@ -1142,12 +1167,193 @@ static void ramen_notice(ramen_handle_t *rm, const char *msg, float secs)
    rm->notice_t = secs;
 }
 
-/* /data may have changed under us: forget what was read from it. */
-static void ramen_forget_data(ramen_handle_t *rm)
+/* ---- systems --------------------------------------------------------- */
+
+static int ramen_selected_system(ramen_handle_t *rm);
+
+/* Adds a ROM directory to a system unless it has it already. */
+static void ramen_sys_add_dir(ramen_system_t *s, const char *dir)
 {
    int i;
 
-   for (i = 0; i < RAMEN_SYSTEMS; i++)
+   if (string_is_empty(dir) || s->ndirs >= RAMEN_SYS_DIRS)
+      return;
+   for (i = 0; i < s->ndirs; i++)
+      if (string_is_equal(s->dirs[i], dir))
+         return;
+   strlcpy(s->dirs[s->ndirs++], dir, sizeof(s->dirs[0]));
+}
+
+/* A user core's colour: a hue hashed from its name, so it keeps it from
+ * boot to boot, at about the built-ins' saturation and brightness. */
+static void ramen_sys_color(const char *name, float *rgb)
+{
+   const float hi = 0.95f, lo = 0.22f;
+   uint32_t h     = 2166136261u;
+   float hue, up, dn;
+   int i;
+
+   for (; *name; name++)
+      h = (h ^ (uint8_t)*name) * 16777619u;
+   hue = (float)(h % 360u) / 60.0f;
+   i   = (int)hue;
+   up  = lo + (hi - lo) * (hue - i);
+   dn  = hi - (hi - lo) * (hue - i);
+   switch (i)
+   {
+      case 0:  rgb[0] = hi; rgb[1] = up; rgb[2] = lo; break;
+      case 1:  rgb[0] = dn; rgb[1] = hi; rgb[2] = lo; break;
+      case 2:  rgb[0] = lo; rgb[1] = hi; rgb[2] = up; break;
+      case 3:  rgb[0] = lo; rgb[1] = dn; rgb[2] = hi; break;
+      case 4:  rgb[0] = up; rgb[1] = lo; rgb[2] = hi; break;
+      default: rgb[0] = hi; rgb[1] = lo; rgb[2] = dn; break;
+   }
+}
+
+/* What a core without an .info says about itself, from
+ * retro_get_system_info(), which libretro allows before retro_init(). Only
+ * fills what is still empty. */
+static void ramen_probe_core(const char *path, char *name, size_t name_len,
+      char *exts, size_t exts_len)
+{
+   struct retro_system_info info;
+   void (*get_info)(struct retro_system_info*);
+   dylib_t lib = dylib_load(path);
+
+   if (!lib)
+   {
+      RARCH_ERR("[ramen] %s: %s\n", path, dylib_error());
+      return;
+   }
+   get_info = (void (*)(struct retro_system_info*))
+      dylib_proc(lib, "retro_get_system_info");
+   if (get_info)
+   {
+      memset(&info, 0, sizeof(info));
+      get_info(&info);
+      if (!*name && info.library_name)
+         strlcpy(name, info.library_name, name_len);
+      if (!*exts && info.valid_extensions)
+         strlcpy(exts, info.valid_extensions, exts_len);
+   }
+   dylib_close(lib);
+}
+
+/* The built-ins, then every <name>_libretro.so in RAMEN_USER_CORE_DIR. A
+ * user core reads /data/roms/<name>, and with a paired <name>_libretro.info
+ * also /data/roms/<systemid>; neither is created, since they are the user's
+ * to make. One that shares a built-in's core file name, or whose name or
+ * systemid is a built-in's directory, replaces that built-in's core and
+ * keeps its slot, label, colour and directory. */
+static void ramen_scan_systems(ramen_handle_t *rm)
+{
+   static const char suffix[] = "_libretro.so";
+   struct string_list *cores;
+   size_t i;
+   int b;
+
+   rm->nsys = RAMEN_BUILTINS;
+   for (b = 0; b < RAMEN_BUILTINS; b++)
+   {
+      ramen_system_t *s = &rm->sys[b];
+
+      memset(s, 0, sizeof(*s));
+      strlcpy(s->name, ramen_builtins[b].name, sizeof(s->name));
+      ramen_sys_add_dir(s, ramen_builtins[b].dir);
+      fill_pathname_join_special(s->core, RAMEN_CORE_DIR,
+            ramen_builtins[b].core, sizeof(s->core));
+      strlcpy(s->exts, ramen_builtins[b].exts, sizeof(s->exts));
+      memcpy(s->rgb, ramen_builtins[b].rgb, sizeof(s->rgb));
+   }
+
+   if (!(cores = dir_list_new(RAMEN_USER_CORE_DIR, "so",
+               false, false, false, false)))
+      return;
+   dir_list_sort(cores, false);
+   for (i = 0; i < cores->size; i++)
+   {
+      const char *path  = cores->elems[i].data;
+      const char *file  = path_basename(path);
+      size_t n          = strlen(file);
+      ramen_system_t *s = NULL;
+      config_file_t *conf;
+      char shortname[64];
+      char sysid[64]    = "";
+      char name[64]     = "";
+      char exts[512]    = "";
+      char info[PATH_MAX_LENGTH];
+
+      if (n <= STRLEN_CONST(suffix)
+            || !string_is_equal(file + n - STRLEN_CONST(suffix), suffix))
+         continue;
+      strlcpy(shortname, file,
+            MIN(sizeof(shortname), n - STRLEN_CONST(suffix) + 1));
+
+      strlcpy(info, path, sizeof(info));
+      path_remove_extension(info);
+      strlcat(info, ".info", sizeof(info));
+      if (     path_is_valid(info)
+            && (conf = config_file_new_from_path_to_string(info)))
+      {
+         config_get_array(conf, "systemid", sysid, sizeof(sysid));
+         config_get_array(conf, "corename", name, sizeof(name));
+         config_get_array(conf, "supported_extensions", exts, sizeof(exts));
+         config_file_free(conf);
+      }
+      if (!*name || !*exts)
+         ramen_probe_core(path, name, sizeof(name), exts, sizeof(exts));
+      if (!*exts)
+      {
+         RARCH_WARN("[ramen] %s: no content extensions, skipped\n", file);
+         continue;
+      }
+
+      for (b = 0; b < RAMEN_BUILTINS && !s; b++)
+         if (     !rm->sys[b].custom
+               && (   string_is_equal(file, ramen_builtins[b].core)
+                   || string_is_equal(shortname, ramen_builtins[b].dir)
+                   || string_is_equal(sysid, ramen_builtins[b].dir)))
+            s = &rm->sys[b];
+      if (!s)
+      {
+         if (rm->nsys >= RAMEN_SYSTEMS_MAX)
+            break;
+         s = &rm->sys[rm->nsys++];
+         memset(s, 0, sizeof(*s));
+         strlcpy(s->name, *name ? name : shortname, sizeof(s->name));
+         ramen_sys_color(shortname, s->rgb);
+      }
+      s->custom = true;
+      strlcpy(s->core, path, sizeof(s->core));
+      strlcpy(s->exts, exts, sizeof(s->exts));
+      ramen_sys_add_dir(s, shortname);
+      ramen_sys_add_dir(s, sysid);
+      RARCH_LOG("[ramen] %s: %s, in /data/roms/%s%s%s\n", s->name, path,
+            s->dirs[0], s->ndirs > 1 ? " and " : "",
+            s->ndirs > 1 ? s->dirs[1] : "");
+   }
+   string_list_free(cores);
+}
+
+/* The system whose key (dirs[0]) this is, or -1. */
+static int ramen_find_system(ramen_handle_t *rm, const char *key)
+{
+   int i;
+
+   for (i = 0; i < rm->nsys; i++)
+      if (string_is_equal(rm->sys[i].dirs[0], key))
+         return i;
+   return -1;
+}
+
+/* /data may have changed under us: forget what was read from it. */
+static void ramen_forget_data(ramen_handle_t *rm)
+{
+   char key[64];
+   int i, cur, sel;
+
+   strlcpy(key, rm->sys[ramen_selected_system(rm)].dirs[0], sizeof(key));
+   for (i = 0; i < RAMEN_SYSTEMS_MAX; i++)
    {
       if (rm->games[i])
          string_list_free(rm->games[i]);
@@ -1158,6 +1364,16 @@ static void ramen_forget_data(ramen_handle_t *rm)
    for (i = 0; i < RAMEN_ART_LAYERS; i++)
       rm->art[i].sys = -1;
    rm->game = 0;
+
+   /* The user's cores may have come or gone too. The wheel stays on the
+    * system it was on, shifted by whole slots so nothing visibly turns. */
+   ramen_scan_systems(rm);
+   cur = ramen_selected_system(rm);
+   if ((sel = ramen_find_system(rm, key)) >= 0 && sel != cur)
+   {
+      rm->wheel_target -= (sel - cur) * RAMEN_SLOT_DEG;
+      rm->wheel        -= (sel - cur) * RAMEN_SLOT_DEG;
+   }
 }
 
 /* Runs the gadget script: from render(), since it blocks for a moment. */
@@ -1195,46 +1411,61 @@ static void ramen_usb_run(ramen_handle_t *rm)
 
 /* ---- persistence ----------------------------------------------------- */
 
-static int ramen_load_last_system(void)
+static int ramen_load_last_system(ramen_handle_t *rm)
 {
    FILE *f = fopen(RAMEN_STATE_PATH, "r");
-   int sys = 0;
+   char key[64];
+   int sys = -1;
 
    if (!f)
       return 0;
-   if (fscanf(f, "%d", &sys) != 1 || sys < 0 || sys >= RAMEN_SYSTEMS)
-      sys = 0;
+   if (fscanf(f, "%63s", key) == 1)
+      sys = ramen_find_system(rm, key);
    fclose(f);
-   return sys;
+   return sys < 0 ? 0 : sys;
 }
 
-static void ramen_save_last_system(int sys)
+static void ramen_save_last_system(ramen_handle_t *rm, int sys)
 {
    FILE *f = fopen(RAMEN_STATE_PATH, "w");
    if (!f)
       return;
-   fprintf(f, "%d\n", sys);
+   fprintf(f, "%s\n", rm->sys[sys].dirs[0]);
    fclose(f);
 }
 
 /* ---- games ----------------------------------------------------------- */
 
+/* By file name, so the directories of a system interleave. */
+static int ramen_game_cmp(const void *a, const void *b)
+{
+   const struct string_list_elem *x = (const struct string_list_elem*)a;
+   const struct string_list_elem *y = (const struct string_list_elem*)b;
+   return strcasecmp(path_basename(x->data), path_basename(y->data));
+}
+
 static void ramen_load_games(ramen_handle_t *rm, int sys)
 {
+   const ramen_system_t *s = &rm->sys[sys];
+   struct string_list *list;
    char dir[PATH_MAX_LENGTH];
+   int i;
 
    if (rm->games_loaded[sys])
       return;
    rm->games_loaded[sys] = true;
 
-   fill_pathname_join_special(dir, RAMEN_ROM_DIR, ramen_systems[sys].dir,
-         sizeof(dir));
-   rm->games[sys] = dir_list_new(dir, ramen_systems[sys].exts,
-         false, false, false, false);
-   if (rm->games[sys])
-      dir_list_sort(rm->games[sys], false);
-   RARCH_LOG("[ramen] %s: %u games in %s\n", ramen_systems[sys].name,
-         rm->games[sys] ? (unsigned)rm->games[sys]->size : 0, dir);
+   if (!(list = string_list_new()))
+      return;
+   /* a directory that does not exist just adds nothing */
+   for (i = 0; i < s->ndirs; i++)
+   {
+      fill_pathname_join_special(dir, RAMEN_ROM_DIR, s->dirs[i], sizeof(dir));
+      dir_list_append(list, dir, s->exts, false, false, false, false);
+   }
+   qsort(list->elems, list->size, sizeof(*list->elems), ramen_game_cmp);
+   rm->games[sys] = list;
+   RARCH_LOG("[ramen] %s: %u games\n", s->name, (unsigned)list->size);
 }
 
 static unsigned ramen_game_count(ramen_handle_t *rm, int sys)
@@ -1357,8 +1588,7 @@ static void ramen_art_load(ramen_handle_t *rm, int sys, int game)
    rm->art[lru].present = false;
    rm->art[lru].stamp   = ++rm->art_stamp;
 
-   fill_pathname_join_special(path, RAMEN_ROM_DIR, ramen_systems[sys].dir,
-         sizeof(path));
+   fill_pathname_basedir(path, rom, sizeof(path));
    fill_pathname_join_special(dir, path, RAMEN_ART_DIR, sizeof(dir));
    fill_pathname_base(base, rom, sizeof(base));
    path_remove_extension(base);
@@ -1402,7 +1632,6 @@ static void ramen_refresh_meta(ramen_handle_t *rm)
    settings_t *settings = config_get_ptr();
    const char *rom      = ramen_game_path(rm, rm->system, rm->game);
    runtime_log_t *log   = NULL;
-   char core[PATH_MAX_LENGTH];
 
    if (rm->meta_sys == rm->system && rm->meta_game == rm->game)
       return;
@@ -1411,9 +1640,7 @@ static void ramen_refresh_meta(ramen_handle_t *rm)
    rm->meta_runtime[0] = rm->meta_last[0] = '\0';
    if (!rom || !settings)
       return;
-   fill_pathname_join_special(core, RAMEN_CORE_DIR,
-         ramen_systems[rm->system].core, sizeof(core));
-   log = runtime_log_init(rom, core,
+   log = runtime_log_init(rom, rm->sys[rm->system].core,
          settings->paths.directory_runtime_log,
          settings->paths.directory_playlist,
          !settings->bools.content_runtime_log_aggregate);
@@ -1516,22 +1743,26 @@ static float ramen_slot_target(int slot)
    return RAMEN_SELECT_DEG - slot * RAMEN_SLOT_DEG;
 }
 
-/* The slot nearest the selected position for a given wheel angle. */
+/* The slot nearest the selected position for a given wheel angle. Slots
+ * are unbounded, like the wheel. */
 static int ramen_slot_at(float wheel)
 {
-   int s = (int)lroundf((RAMEN_SELECT_DEG - wheel) / RAMEN_SLOT_DEG);
-   return ((s % RAMEN_SLOTS) + RAMEN_SLOTS) % RAMEN_SLOTS;
+   return (int)lroundf((RAMEN_SELECT_DEG - wheel) / RAMEN_SLOT_DEG);
+}
+
+static int ramen_slot_system(ramen_handle_t *rm, int slot)
+{
+   return ((slot % rm->nsys) + rm->nsys) % rm->nsys;
 }
 
 static int ramen_selected_system(ramen_handle_t *rm)
 {
-   return ramen_slot_at(rm->wheel_target) % RAMEN_SYSTEMS;
+   return ramen_slot_system(rm, ramen_slot_at(rm->wheel_target));
 }
 
 static void ramen_begin_boot_spin(ramen_handle_t *rm, int system)
 {
-   /* The slot holding the last-played system nearest the selected position
-    * is as good as any, since the carousel repeats. */
+   /* Slot n holds system n, as good as any, since the carousel repeats. */
    rm->wheel_target = ramen_slot_target(system);
    /* Spin clockwise (increasing angle), so start behind the target. The
     * friction integral v0/k must cover the distance minus the spring's
@@ -2198,16 +2429,14 @@ static void ramen_return_from_game(ramen_handle_t *rm)
 static void ramen_start_game(ramen_handle_t *rm)
 {
    content_ctx_info_t info;
-   char core[PATH_MAX_LENGTH];
-   const char *rom = ramen_game_path(rm, rm->system, rm->game);
+   const char *core = rm->sys[rm->system].core;
+   const char *rom  = ramen_game_path(rm, rm->system, rm->game);
 
    if (!rom)
       return;
    memset(&info, 0, sizeof(info));
-   fill_pathname_join_special(core, RAMEN_CORE_DIR,
-         ramen_systems[rm->system].core, sizeof(core));
    RARCH_LOG("[ramen] launching %s with %s\n", rom, core);
-   ramen_save_last_system(rm->system);
+   ramen_save_last_system(rm, rm->system);
    /* RetroArch closes the menu itself once the content is up. */
    if (!task_push_load_content_with_new_core_from_menu(core, rom, &info,
             CORE_TYPE_PLAIN, NULL, NULL))
@@ -2241,7 +2470,8 @@ static void *ramen_init(void **userdata, bool video_is_threaded)
    rm->ig_h       = 1.0f;
    rm->bat_pct    = -1;
    rm->vol        = -1;
-   ramen_begin_boot_spin(rm, ramen_load_last_system());
+   ramen_scan_systems(rm);
+   ramen_begin_boot_spin(rm, ramen_load_last_system(rm));
    return menu;
 }
 
@@ -2259,7 +2489,7 @@ static void ramen_free(void *data)
    if (rm->font)
       font_driver_free(rm->font);
    rm->font = NULL;
-   for (i = 0; i < RAMEN_SYSTEMS; i++)
+   for (i = 0; i < RAMEN_SYSTEMS_MAX; i++)
    {
       if (rm->games[i])
          string_list_free(rm->games[i]);
@@ -2403,16 +2633,13 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
 
    /* The system spheres. In a sequence the selected one is driven by the
     * timeline and the neighbours retract past their edges. */
-   for (k = 0; k < RAMEN_SLOTS && count < RAMEN_MAX_SPHERES; k++)
+   for (k = (int)ceilf((-20.0f - rm->wheel) / RAMEN_SLOT_DEG);
+        rm->wheel + k * RAMEN_SLOT_DEG <= 90.0f + 20.0f
+        && count < RAMEN_MAX_SPHERES; k++)
    {
-      float deg = fmodf(rm->wheel + k * RAMEN_SLOT_DEG, 360.0f);
+      float deg = rm->wheel + k * RAMEN_SLOT_DEG;
       float stretch, dim, scale;
       bool selected = (k == selected_slot);
-
-      if (deg < 0.0f)
-         deg += 360.0f;
-      if (deg > 90.0f + 20.0f && deg < 360.0f - 20.0f)
-         continue;
 
       if (in_sequence)
       {
@@ -2443,7 +2670,7 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
       spheres[count][1] = scale;
       spheres[count][2] = stretch;
       spheres[count][3] = dim;
-      memcpy(colors[count], ramen_systems[k % RAMEN_SYSTEMS].rgb,
+      memcpy(colors[count], rm->sys[ramen_slot_system(rm, k)].rgb,
             sizeof(colors[count]));
       alphas[count] = 1.0f;
       arts[count]   = -1.0f;
@@ -2526,9 +2753,9 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
          spheres[count][1] = RAMEN_GAME_SCALE * (i == 0 ? 1.15f : 1.0f);
          spheres[count][2] = MIN(2.0f, fabsf(rm->gwheel_vel) / 300.0f);
          spheres[count][3] = (i == 0) ? 0.0f : 0.5f;
-         colors[count][0]  = ramen_systems[rm->system].rgb[0] * 1.1f;
-         colors[count][1]  = ramen_systems[rm->system].rgb[1] * 1.1f;
-         colors[count][2]  = ramen_systems[rm->system].rgb[2] * 1.1f;
+         colors[count][0]  = rm->sys[rm->system].rgb[0] * 1.1f;
+         colors[count][1]  = rm->sys[rm->system].rgb[1] * 1.1f;
+         colors[count][2]  = rm->sys[rm->system].rgb[2] * 1.1f;
          count++;
       }
    }
@@ -2683,7 +2910,7 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
          float cy    = pivot[1] - radius * sinf(a);
          float rise  = RAMEN_SPHERE_R * S * (0.35f - 0.15f * ease);
 
-         gfx_display_draw_text(rm->font, ramen_systems[sys].name,
+         gfx_display_draw_text(rm->font, rm->sys[sys].name,
                cx, cy + rise + rm->font_size * 0.35f, width, height,
                COLOR_ABGR(255, 255, 255, (unsigned)(ease * alpha)),
                TEXT_ALIGN_CENTER, 1.0f, false, 0.0f, true);
@@ -2834,8 +3061,20 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
          if (path)
             ramen_game_title(path, title, sizeof(title));
          else
+         {
+            /* "No games in /data/roms/a, b or c" */
+            const ramen_system_t *s = &rm->sys[rm->system];
+            int d;
+
             snprintf(title, sizeof(title), "No games in %s/%s",
-                  RAMEN_ROM_DIR, ramen_systems[rm->system].dir);
+                  RAMEN_ROM_DIR, s->dirs[0]);
+            for (d = 1; d < s->ndirs; d++)
+            {
+               strlcat(title, d == s->ndirs - 1 ? " or " : ", ",
+                     sizeof(title));
+               strlcat(title, s->dirs[d], sizeof(title));
+            }
+         }
          /* the title gets up to two lines; the details follow below */
          lines = ramen_wrap_text(rm->font, title, 0.55f * zoomv, sw,
                l1, l2, sizeof(l1));
@@ -2853,7 +3092,7 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
          {
             ramen_refresh_meta(rm);
             snprintf(line, sizeof(line), "%s   %d / %u",
-                  ramen_systems[rm->system].name, rm->game + 1,
+                  rm->sys[rm->system].name, rm->game + 1,
                   ramen_game_count(rm, rm->system));
             gfx_display_draw_text(rm->font, line,
                   sx, y, width, height,

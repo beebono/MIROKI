@@ -26,7 +26,7 @@ A frontend menu designed around the RG Rotate's swivel screen. The UI treats the
 
 Three systems spaced evenly around a full circle would sit 120° apart, which is wider than the 90° visible arc, so the neighbors could never be seen. The wheel is therefore a repeating carousel.
 
-- **Slots.** 9 slots at 40° spacing, holding the three systems three times over: `A B C A B C A B C`.
+- **Slots.** Slots at 40° spacing cycle through the systems for as far as the wheel turns: `A B C A B C …`. Nine of them make the full circle with the three built-in systems; user cores add systems, and the cycle simply gets longer.
 - **Selected position.** `θ = 45°`, on the screen's diagonal through the pivot.
 - **Neighbors.** At `θ = 5°` (at the bottom edge) and `θ = 85°` (at the right edge). Each sits right at a screen edge and is partially clipped, which gives the "peeking" look.
 - **Selected styling.** The centered sphere is scaled to about 1.1–1.2× and the neighbors are slightly dimmed.
@@ -139,7 +139,7 @@ The pivot remains the fixed reference point throughout.
 | Boot spin + settle | 0.8–1.2 s, skippable on any input |
 | Low-information lead-in (backlight) | ~100 ms |
 | Detent spring damping ratio | ~0.6–0.8 (underdamped) |
-| System slot spacing | 40° (9 slots), neighbors partially clipped |
+| System slot spacing | 40°, neighbors partially clipped |
 | Selected sphere scale | 1.1–1.2× |
 | Label surface / sink | ~200–300 ms / ~100–150 ms |
 | Confirm jiggle | 150–250 ms |

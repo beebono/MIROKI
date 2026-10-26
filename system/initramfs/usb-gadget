@@ -20,9 +20,10 @@ G=/sys/kernel/config/usb_gadget/miroki
 MS=$G/functions/mass_storage.0
 LUN=$MS/lun.0
 
+# Always succeeds, so a function may end on it.
 log() {
     echo "usb-gadget: $*" > /dev/kmsg
-    [ -t 2 ] && echo "usb-gadget: $*" >&2
+    if [ -t 2 ]; then echo "usb-gadget: $*" >&2; fi
 }
 
 # /dev node of the eMMC partition named $1 (same as init's and rcS's).

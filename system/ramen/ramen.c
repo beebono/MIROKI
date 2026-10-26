@@ -22,6 +22,7 @@
  * directories, and launching a game. No monitor or sound yet.
  */
 
+#include <dirent.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,6 +30,8 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include <compat/strl.h>
 #include <dynamic/dylib.h>
@@ -64,9 +67,17 @@
 
 #define RAMEN_FONT_PATH   "/usr/share/miroki/fonts/Audiowide-Regular.ttf"
 #define RAMEN_STATE_PATH  "/data/.config/ramen"
-#define RAMEN_ROM_DIR     "/data/roms"
 #define RAMEN_CORE_DIR    "/usr/lib/libretro"
-#define RAMEN_USER_CORE_DIR "/data/cores"
+
+/* User content: bios, cores and roms at the top of /data and, when a card
+ * is in, the SD card. /data comes first wherever both have something. */
+#define RAMEN_SD_DIR      "/sd"
+static const char *const ramen_roots[] = { "/data", RAMEN_SD_DIR };
+#define RAMEN_ROOTS       2
+
+/* RetroArch takes one system directory: links to the entries of every
+ * root's bios directory (etc/retroarch.cfg points here). */
+#define RAMEN_BIOS_LINKS  "/run/miroki/bios"
 
 /* Carousel: slots 40 degrees apart cycling through the systems, A B C A B C
  * for as far as the wheel turns, so any number of systems repeats evenly.
@@ -225,8 +236,10 @@ enum ramen_sound
    SND_END
 };
 
-/* USB storage from the carousel: Start hands /data to the host, a host
- * eject (or Start again) takes it back; /data is polled this often. */
+/* Storage Mode from the carousel: Start unmounts the SD card so it can be
+ * swapped and hands /data to the host over USB; a host eject (or Start
+ * again) takes /data back and mounts whatever card is in. /data and the
+ * card slot are polled this often. */
 #define RAMEN_USB_POLL_S  0.5f
 
 /* Idle: once nothing is moving and there has been no input for a while,
@@ -271,7 +284,7 @@ enum ramen_sound
 static const struct
 {
    const char *name;
-   const char *dir;      /* under RAMEN_ROM_DIR */
+   const char *dir;      /* under each root's roms */
    const char *core;     /* under RAMEN_CORE_DIR */
    const char *exts;     /* dir_list_new() filter */
    float rgb[3];
@@ -287,14 +300,13 @@ static const struct
      { 0.95f, 0.45f, 0.20f } },
 };
 
-/* The carousel's systems: the built-ins, then the user's cores from
- * RAMEN_USER_CORE_DIR. A user core named like a built-in's core, or whose
- * short name is a built-in's directory, takes that built-in's place. dirs[0]
- * is the system's key, saved as the last played. */
+/* The carousel's systems: the built-ins, then the user's cores from each
+ * root's cores directory (see ramen_scan_cores). dirs[0] is the system's
+ * key, saved as the last played. */
 typedef struct
 {
    char name[64];
-   char dirs[RAMEN_SYS_DIRS][64];   /* under RAMEN_ROM_DIR */
+   char dirs[RAMEN_SYS_DIRS][64];   /* under each root's roms */
    int  ndirs;
    char core[PATH_MAX_LENGTH];
    char exts[512];
@@ -310,7 +322,7 @@ enum ramen_state
    RAMEN_RETURNING,      /* games fall out, then seq runs 1 -> 0 */
    RAMEN_STARTING,       /* diving into the glass, then the core loads */
    RAMEN_INGAME,         /* the in-game menu over the paused frame */
-   RAMEN_USB             /* /data exported to the host */
+   RAMEN_USB             /* Storage Mode: /data exported, the card out */
 };
 
 typedef struct ramen_handle
@@ -362,10 +374,11 @@ typedef struct ramen_handle
    int   ig_scroll_row;
    float ig_scroll_t;
 
-   /* Boot spin ticks, USB storage, and a notice line in the carousel. */
+   /* Boot spin ticks, Storage Mode, and a notice line in the carousel. */
    int   boot_slot;
-   int   usb_req;        /* 1 = export, 2 = take back */
+   int   usb_req;        /* 1 = enter, 2 = take /data back, 3 = it is back */
    float usb_poll;
+   bool  sd_present;     /* a card in the slot, polled in Storage Mode */
    char  notice[128];
    float notice_t;
 
@@ -1143,21 +1156,48 @@ static void ramen_read_status(ramen_handle_t *rm)
 
 /* ---- USB storage ------------------------------------------------------- */
 
-static bool ramen_data_mounted(void)
+static bool ramen_mounted(const char *dir)
 {
    FILE *f = fopen("/proc/mounts", "r");
    char line[512];
+   char want[PATH_MAX_LENGTH];
    bool found = false;
 
    if (!f)
       return false;
+   snprintf(want, sizeof(want), " %s ", dir);
    while (fgets(line, sizeof(line), f))
-      if (strstr(line, " /data "))
+      if (strstr(line, want))
       {
          found = true;
          break;
       }
    fclose(f);
+   return found;
+}
+
+/* Whether a card is in the slot: an SD-type MMC disk. */
+static bool ramen_sd_present(void)
+{
+   DIR *d = opendir("/sys/class/block");
+   struct dirent *e;
+   bool found = false;
+
+   if (!d)
+      return false;
+   while (!found && (e = readdir(d)))
+   {
+      char path[PATH_MAX_LENGTH];
+      char type[8];
+
+      if (strncmp(e->d_name, "mmcblk", 6) || strchr(e->d_name, 'p'))
+         continue;
+      snprintf(path, sizeof(path), "/sys/class/block/%s/device/type",
+            e->d_name);
+      found = ramen_read_line(path, type, sizeof(type))
+         && string_is_equal(type, "SD");
+   }
+   closedir(d);
    return found;
 }
 
@@ -1239,35 +1279,23 @@ static void ramen_probe_core(const char *path, char *name, size_t name_len,
    dylib_close(lib);
 }
 
-/* The built-ins, then every <name>_libretro.so in RAMEN_USER_CORE_DIR. A
- * user core reads /data/roms/<name>, and with a paired <name>_libretro.info
- * also /data/roms/<systemid>; neither is created, since they are the user's
- * to make. One that shares a built-in's core file name, or whose name or
- * systemid is a built-in's directory, replaces that built-in's core and
- * keeps its slot, label, colour and directory. */
-static void ramen_scan_systems(ramen_handle_t *rm)
+/* The user cores in one root's cores directory, <name>_libretro.so. One
+ * reads roms/<name>, and with a paired <name>_libretro.info also
+ * roms/<systemid>, under every root; neither is created, since they are
+ * the user's to make. One that shares a built-in's core file name, or whose
+ * name or systemid is a built-in's directory, replaces that built-in's core
+ * and keeps its slot, label, colour and directory. A core file name already
+ * seen in an earlier root is skipped. */
+static void ramen_scan_cores(ramen_handle_t *rm, const char *root)
 {
    static const char suffix[] = "_libretro.so";
    struct string_list *cores;
+   char dir[PATH_MAX_LENGTH];
    size_t i;
    int b;
 
-   rm->nsys = RAMEN_BUILTINS;
-   for (b = 0; b < RAMEN_BUILTINS; b++)
-   {
-      ramen_system_t *s = &rm->sys[b];
-
-      memset(s, 0, sizeof(*s));
-      strlcpy(s->name, ramen_builtins[b].name, sizeof(s->name));
-      ramen_sys_add_dir(s, ramen_builtins[b].dir);
-      fill_pathname_join_special(s->core, RAMEN_CORE_DIR,
-            ramen_builtins[b].core, sizeof(s->core));
-      strlcpy(s->exts, ramen_builtins[b].exts, sizeof(s->exts));
-      memcpy(s->rgb, ramen_builtins[b].rgb, sizeof(s->rgb));
-   }
-
-   if (!(cores = dir_list_new(RAMEN_USER_CORE_DIR, "so",
-               false, false, false, false)))
+   fill_pathname_join_special(dir, root, "cores", sizeof(dir));
+   if (!(cores = dir_list_new(dir, "so", false, false, false, false)))
       return;
    dir_list_sort(cores, false);
    for (i = 0; i < cores->size; i++)
@@ -1286,6 +1314,16 @@ static void ramen_scan_systems(ramen_handle_t *rm)
       if (n <= STRLEN_CONST(suffix)
             || !string_is_equal(file + n - STRLEN_CONST(suffix), suffix))
          continue;
+      for (b = 0; b < rm->nsys; b++)
+         if (     rm->sys[b].custom
+               && string_is_equal(path_basename(rm->sys[b].core), file))
+            break;
+      if (b < rm->nsys)
+      {
+         RARCH_LOG("[ramen] %s: already loaded from %s, skipped\n", path,
+               rm->sys[b].core);
+         continue;
+      }
       strlcpy(shortname, file,
             MIN(sizeof(shortname), n - STRLEN_CONST(suffix) + 1));
 
@@ -1328,11 +1366,81 @@ static void ramen_scan_systems(ramen_handle_t *rm)
       strlcpy(s->exts, exts, sizeof(s->exts));
       ramen_sys_add_dir(s, shortname);
       ramen_sys_add_dir(s, sysid);
-      RARCH_LOG("[ramen] %s: %s, in /data/roms/%s%s%s\n", s->name, path,
+      RARCH_LOG("[ramen] %s: %s, in roms/%s%s%s\n", s->name, path,
             s->dirs[0], s->ndirs > 1 ? " and " : "",
             s->ndirs > 1 ? s->dirs[1] : "");
    }
    string_list_free(cores);
+}
+
+/* The built-ins, then the user cores of every root. */
+static void ramen_scan_systems(ramen_handle_t *rm)
+{
+   int b;
+
+   rm->nsys = RAMEN_BUILTINS;
+   for (b = 0; b < RAMEN_BUILTINS; b++)
+   {
+      ramen_system_t *s = &rm->sys[b];
+
+      memset(s, 0, sizeof(*s));
+      strlcpy(s->name, ramen_builtins[b].name, sizeof(s->name));
+      ramen_sys_add_dir(s, ramen_builtins[b].dir);
+      fill_pathname_join_special(s->core, RAMEN_CORE_DIR,
+            ramen_builtins[b].core, sizeof(s->core));
+      strlcpy(s->exts, ramen_builtins[b].exts, sizeof(s->exts));
+      memcpy(s->rgb, ramen_builtins[b].rgb, sizeof(s->rgb));
+   }
+
+   for (b = 0; b < RAMEN_ROOTS; b++)
+      ramen_scan_cores(rm, ramen_roots[b]);
+}
+
+/* Fills RAMEN_BIOS_LINKS with a link to each entry of every root's bios
+ * directory, the first root's winning a name both have. Entries are linked
+ * whole, so a core writing under a subdirectory writes to the real one; a
+ * file a core makes at the top level stays in /run until reboot. */
+static void ramen_link_bios(void)
+{
+   char src[PATH_MAX_LENGTH];
+   char link[PATH_MAX_LENGTH];
+   struct dirent *e;
+   struct stat st;
+   DIR *d;
+   int r;
+
+   path_mkdir(RAMEN_BIOS_LINKS);
+   /* the old links go; whatever a core made here stays */
+   if ((d = opendir(RAMEN_BIOS_LINKS)))
+   {
+      while ((e = readdir(d)))
+      {
+         fill_pathname_join_special(link, RAMEN_BIOS_LINKS, e->d_name,
+               sizeof(link));
+         if (lstat(link, &st) == 0 && S_ISLNK(st.st_mode))
+            unlink(link);
+      }
+      closedir(d);
+   }
+   for (r = 0; r < RAMEN_ROOTS; r++)
+   {
+      char dir[PATH_MAX_LENGTH];
+
+      fill_pathname_join_special(dir, ramen_roots[r], "bios", sizeof(dir));
+      if (!(d = opendir(dir)))
+         continue;
+      while ((e = readdir(d)))
+      {
+         if (e->d_name[0] == '.')
+            continue;
+         fill_pathname_join_special(src, dir, e->d_name, sizeof(src));
+         fill_pathname_join_special(link, RAMEN_BIOS_LINKS, e->d_name,
+               sizeof(link));
+         if (lstat(link, &st) != 0 && symlink(src, link) != 0)
+            RARCH_WARN("[ramen] cannot link %s\n", src);
+      }
+      closedir(d);
+   }
 }
 
 /* The system whose key (dirs[0]) this is, or -1. */
@@ -1365,8 +1473,10 @@ static void ramen_forget_data(ramen_handle_t *rm)
       rm->art[i].sys = -1;
    rm->game = 0;
 
-   /* The user's cores may have come or gone too. The wheel stays on the
-    * system it was on, shifted by whole slots so nothing visibly turns. */
+   /* The user's cores and BIOS may have come or gone too. The wheel stays
+    * on the system it was on, shifted by whole slots so nothing visibly
+    * turns. */
+   ramen_link_bios();
    ramen_scan_systems(rm);
    cur = ramen_selected_system(rm);
    if ((sel = ramen_find_system(rm, key)) >= 0 && sel != cur)
@@ -1379,33 +1489,50 @@ static void ramen_forget_data(ramen_handle_t *rm)
 /* Runs the gadget script: from render(), since it blocks for a moment. */
 static void ramen_usb_run(ramen_handle_t *rm)
 {
-   int req = rm->usb_req;
+   int req   = rm->usb_req;
+   bool back = (req == 3);
    int r;
 
    rm->usb_req = 0;
    if (req == 1)
    {
+      if (system("sdcard umount") != 0)
+      {
+         ramen_notice(rm, "Could not enter Storage Mode: the SD card is busy", 4.0f);
+         return;
+      }
       r = system("usb-gadget storage on");
       if (r == 0)
       {
-         rm->state    = RAMEN_USB;
-         rm->usb_poll = 0.0f;
-         rm->notice[0] = '\0';
+         rm->state      = RAMEN_USB;
+         rm->usb_poll   = 0.0f;
+         rm->sd_present = ramen_sd_present();
+         rm->notice[0]  = '\0';
       }
       else
-         ramen_notice(rm, "Could not share the drive: /data is busy", 4.0f);
+      {
+         r = system("sdcard mount");
+         ramen_notice(rm, "Could not enter Storage Mode: /data is busy", 4.0f);
+      }
    }
    else if (req == 2)
    {
       r = system("usb-gadget storage off");
-      if (r == 0 || ramen_data_mounted())
-      {
-         rm->state = RAMEN_SYSTEM;
-         ramen_forget_data(rm);
-         ramen_snd_play(SND_BACK);
-      }
+      if (r == 0 || ramen_mounted("/data"))
+         back = true;
       else
          ramen_notice(rm, "The host still holds the drive: eject it there first", 4.0f);
+   }
+   /* /data is back (here or from the gadget's eject watcher): the card
+    * next, then everything read from either is read again. */
+   if (back)
+   {
+      r = system("sdcard mount");
+      rm->state = RAMEN_SYSTEM;
+      ramen_forget_data(rm);
+      ramen_snd_play(SND_BACK);
+      if (r != 0)
+         ramen_notice(rm, "Could not mount the SD card (exFAT or FAT only)", 4.0f);
    }
 }
 
@@ -1449,7 +1576,7 @@ static void ramen_load_games(ramen_handle_t *rm, int sys)
    const ramen_system_t *s = &rm->sys[sys];
    struct string_list *list;
    char dir[PATH_MAX_LENGTH];
-   int i;
+   int i, r;
 
    if (rm->games_loaded[sys])
       return;
@@ -1458,10 +1585,16 @@ static void ramen_load_games(ramen_handle_t *rm, int sys)
    if (!(list = string_list_new()))
       return;
    /* a directory that does not exist just adds nothing */
-   for (i = 0; i < s->ndirs; i++)
+   for (r = 0; r < RAMEN_ROOTS; r++)
    {
-      fill_pathname_join_special(dir, RAMEN_ROM_DIR, s->dirs[i], sizeof(dir));
-      dir_list_append(list, dir, s->exts, false, false, false, false);
+      char roms[PATH_MAX_LENGTH];
+
+      fill_pathname_join_special(roms, ramen_roots[r], "roms", sizeof(roms));
+      for (i = 0; i < s->ndirs; i++)
+      {
+         fill_pathname_join_special(dir, roms, s->dirs[i], sizeof(dir));
+         dir_list_append(list, dir, s->exts, false, false, false, false);
+      }
    }
    qsort(list->elems, list->size, sizeof(*list->elems), ramen_game_cmp);
    rm->games[sys] = list;
@@ -1967,19 +2100,17 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
       }
    }
 
-   /* Exported: once the host ejects, the gadget script remounts /data. */
+   /* Storage Mode: once the host ejects, the gadget script remounts
+    * /data, and render() takes it from there. */
    if (rm->state == RAMEN_USB)
    {
       rm->usb_poll += dt;
       if (rm->usb_poll >= RAMEN_USB_POLL_S)
       {
-         rm->usb_poll = 0.0f;
-         if (ramen_data_mounted())
-         {
-            rm->state = RAMEN_SYSTEM;
-            ramen_forget_data(rm);
-            ramen_snd_play(SND_BACK);
-         }
+         rm->usb_poll   = 0.0f;
+         rm->sd_present = ramen_sd_present();
+         if (!rm->usb_req && ramen_mounted("/data"))
+            rm->usb_req = 3;
       }
    }
 
@@ -2470,6 +2601,15 @@ static void *ramen_init(void **userdata, bool video_is_threaded)
    rm->ig_h       = 1.0f;
    rm->bat_pct    = -1;
    rm->vol        = -1;
+   /* A config from before the links still names /data/bios. */
+   {
+      settings_t *settings = config_get_ptr();
+      if (settings && !string_is_equal(settings->paths.directory_system,
+               RAMEN_BIOS_LINKS))
+         configuration_set_string(settings, settings->paths.directory_system,
+               RAMEN_BIOS_LINKS);
+   }
+   ramen_link_bios();
    ramen_scan_systems(rm);
    ramen_begin_boot_spin(rm, ramen_load_last_system(rm));
    return menu;
@@ -2924,20 +3064,25 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
       {
          float x = width * 0.06f;
          float y = height * 0.14f;
-         gfx_display_draw_text(rm->font, "USB drive", x, y, width, height,
+         gfx_display_draw_text(rm->font, "Storage Mode", x, y, width, height,
                COLOR_ABGR(255, 255, 255, alpha), TEXT_ALIGN_LEFT, 0.7f,
                false, 0.0f, true);
-         gfx_display_draw_text(rm->font, "Shared with the host.", x,
+         gfx_display_draw_text(rm->font, "Data is shared over USB.", x,
                y + rm->font_size * 0.9f, width, height,
                COLOR_ABGR(190, 205, 220, alpha), TEXT_ALIGN_LEFT, 0.45f,
                false, 0.0f, true);
-         gfx_display_draw_text(rm->font, "Eject it there, or press Start.", x,
+         gfx_display_draw_text(rm->font, rm->sd_present
+               ? "SD card: in, safe to remove." : "SD card: none.", x,
                y + rm->font_size * 1.5f, width, height,
+               COLOR_ABGR(190, 205, 220, alpha), TEXT_ALIGN_LEFT, 0.45f,
+               false, 0.0f, true);
+         gfx_display_draw_text(rm->font, "Eject the drive, or press Start.", x,
+               y + rm->font_size * 2.1f, width, height,
                COLOR_ABGR(190, 205, 220, alpha), TEXT_ALIGN_LEFT, 0.45f,
                false, 0.0f, true);
          if (rm->notice_t > 0.0f)
             gfx_display_draw_text(rm->font, rm->notice, x,
-                  y + rm->font_size * 2.4f, width, height,
+                  y + rm->font_size * 3.0f, width, height,
                   COLOR_ABGR(255, 200, 120, alpha), TEXT_ALIGN_LEFT, 0.45f,
                   false, 0.0f, true);
       }
@@ -3062,12 +3207,12 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
             ramen_game_title(path, title, sizeof(title));
          else
          {
-            /* "No games in /data/roms/a, b or c" */
+            /* "No games in roms/a, b or c" */
             const ramen_system_t *s = &rm->sys[rm->system];
             int d;
 
-            snprintf(title, sizeof(title), "No games in %s/%s",
-                  RAMEN_ROM_DIR, s->dirs[0]);
+            snprintf(title, sizeof(title), "No games in roms/%s",
+                  s->dirs[0]);
             for (d = 1; d < s->ndirs; d++)
             {
                strlcat(title, d == s->ndirs - 1 ? " or " : ", ",

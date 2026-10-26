@@ -88,7 +88,7 @@ make -C "$BUSYBOX_DIR" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" CONFIG_PREFIX="
 rm -f "$ROOT_DIR/linuxrc"
 
 # mount points: the initramfs moves dev/proc/sys over, rcS mounts the rest
-mkdir -p "$ROOT_DIR"/{dev,proc,sys,run,tmp,data,etc,lib/firmware}
+mkdir -p "$ROOT_DIR"/{dev,proc,sys,run,tmp,data,sd,etc,lib/firmware}
 
 cp -a "$SKEL_DIR/." "$ROOT_DIR/"
 chmod +x "$ROOT_DIR/etc/init.d/rcS" "$ROOT_DIR/etc/init.d/rcK"

@@ -82,6 +82,9 @@ seed_config() {
 }
 mount_data
 
+# The SD card, if one is in: more bios, cores and roms for ramen (sdcard).
+sdcard mount
+
 # Audio routing, from ROCKNIX's sprdphone-sc2730 UCM BootSequence by way of
 # old MIROKI. The speaker is the codec's HP path into the external AW87390
 # amp, not the SPK pin. No "DSP VBC Profile Select": the driver only keeps a

@@ -1,0 +1,74 @@
+#!/bin/sh
+# sdcard: the optional SD card, mounted on /sd. ramen reads bios, cores and
+# roms from its top level alongside /data's.
+#
+#   sdcard mount     mount the card if one is in: its first partition, or
+#                    the whole card when it has no partition table. No card
+#                    is not an error.
+#   sdcard umount    flush and unmount it so it can come out; fails while
+#                    something (a running core) has a file open on it
+#   sdcard status
+#
+# There is no hotplug handling: ramen's Storage Mode unmounts the card while
+# it is up, and mounts whatever is in the slot on the way out.
+
+MNT=/sd
+
+# Always succeeds, so a function may end on it.
+log() {
+    echo "sdcard: $*" > /dev/kmsg
+    if [ -t 2 ]; then echo "sdcard: $*" >&2; fi
+}
+
+# /dev node to mount: the SD card's first partition, else the card itself.
+find_card() {
+    for d in /sys/class/block/mmcblk*; do
+        [ -f "$d/partition" ] && continue
+        [ "$(cat "$d/device/type" 2>/dev/null)" = SD ] || continue
+        disk=${d##*/}
+        if [ -e "/sys/class/block/${disk}p1" ]; then
+            echo "/dev/${disk}p1"
+        else
+            echo "/dev/$disk"
+        fi
+        return 0
+    done
+    return 1
+}
+
+do_mount() {
+    mountpoint -q "$MNT" && return 0
+    dev=$(find_card) || { log "no card"; return 0; }
+    type=$(blkid "$dev" | sed -n 's/.* TYPE="\([^"]*\)".*/\1/p')
+    case "$type" in
+    exfat)
+        if ! mount -t exfat -o noatime "$dev" "$MNT"; then
+            log "$dev: exFAT mount failed, running fsck.exfat"
+            fsck.exfat -y "$dev" > /dev/kmsg 2>&1
+            mount -t exfat -o noatime "$dev" "$MNT" || { log "$dev: still not mountable"; return 1; }
+        fi ;;
+    vfat)
+        mount -t vfat -o noatime,utf8,shortname=mixed "$dev" "$MNT" || { log "$dev: FAT mount failed"; return 1; }
+        ;;
+    *)
+        log "$dev holds ${type:-no filesystem}; only exFAT and FAT are read"
+        return 1 ;;
+    esac
+    log "$dev ($type) mounted on $MNT"
+}
+
+do_umount() {
+    mountpoint -q "$MNT" || return 0
+    sync
+    umount "$MNT" || { log "$MNT is busy, not unmounting"; return 1; }
+    log "unmounted; the card can come out"
+}
+
+case "$1" in
+    mount)  do_mount ;;
+    umount) do_umount ;;
+    status)
+        dev=$(find_card) && echo "card: $dev" || echo "card: none"
+        mountpoint -q "$MNT" && echo "$MNT: mounted" || echo "$MNT: not mounted" ;;
+    *)      echo "usage: sdcard mount|umount|status" >&2; exit 2 ;;
+esac

@@ -148,9 +148,16 @@ everything that changes: ROMs, saves, states and RetroArch's settings.
   built-in core. Cores must render in software or through GLES, and need
   only the libraries already on the device.
 
-To copy files over, press Start in the system carousel: the device shares
-`data` with the computer as a USB drive, and takes it back when the computer
-ejects it (or on Start again).
+An SD card is optional. If one is in (exFAT or FAT), its top-level `bios`,
+`cores` and `roms` folders are read alongside the ones on `data`, laid out
+the same way; where both have the same BIOS or core file, `data`'s is used.
+Saves, states and settings always stay on `data`.
+
+Press Start in the system carousel for Storage Mode: the device shares
+`data` with the computer as a USB drive and unmounts the SD card, so the card
+can be taken out or swapped. It leaves Storage Mode when the computer ejects
+the drive (or on Start again), then mounts whatever card is in and reads
+everything again.
 
 ## Controls
 
@@ -160,6 +167,7 @@ ejects it (or on Start again).
 | Mode + R1 / L1 | Save / load state |
 | Mode + R2 | Fast-forward on/off |
 | Mode + Right / Left | Next / previous state slot |
+| Start, in the carousel | Storage Mode |
 | Volume keys | Volume |
 | Mode + volume keys | Screen brightness |
 | Power, short press, or closing the swivel | Sleep |

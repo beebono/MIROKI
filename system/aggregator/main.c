@@ -21,9 +21,10 @@
 // (/data/.config/backlight, the raw brightness, also restored by rcS and
 // by ramen when its screensaver wakes); the power key and the swivel's
 // hall switch put the device
-// to sleep. Sleep is suspend-to-idle: the EL3 monitor has no CPU_SUSPEND
-// yet, so "mem" is out, and the sprd DRM driver has no suspend hooks, so
-// the backlight is switched off around it by hand. Holding the power key
+// to sleep. Sleep is "mem": the EL3 monitor's SYSTEM_SUSPEND takes the SoC
+// into deep sleep. The DRM driver turns the panel off and on across it; the
+// backlight is still switched off around it by hand, so nothing lights up
+// before the panel is back. Holding the power key
 // for two seconds powers off, with a short buzz to say the hold took.
 
 #include <dirent.h>
@@ -435,7 +436,7 @@ static void go_to_sleep(const char *why)
     write_str(BACKLIGHT, "1");
     sync();
     fd = open("/sys/power/state", O_WRONLY | O_CLOEXEC);
-    if (fd < 0 || write(fd, "freeze", 6) < 0)
+    if (fd < 0 || write(fd, "mem", 3) < 0)
         klog("suspend failed: %s", strerror(errno));
     if (fd >= 0)
         close(fd);

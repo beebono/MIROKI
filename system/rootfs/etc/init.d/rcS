@@ -136,3 +136,13 @@ backlight_init() {
     [ "$v" -ge 1 ] && [ "$v" -le "$(cat $b/max_brightness)" ] && echo "$v" > $b/brightness
 }
 backlight_init
+
+# The sc27xx RTC reads as invalid until it is first set (and again after the
+# battery is out), and then rtcwake can't arm an alarm and deep sleep goes
+# unaccounted in the clock. Nothing here knows the real time, so any valid
+# one will do.
+rtc_init() {
+    hwclock -r >/dev/null 2>&1 && return 0
+    date -s '2026-01-01 00:00:00' >/dev/null && hwclock -w && log "rtc was invalid, seeded"
+}
+rtc_init

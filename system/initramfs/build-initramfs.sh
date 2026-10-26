@@ -3,7 +3,9 @@
 # Assemble the initramfs tree that tools/build_cfw_boot.sh builds into the
 # kernel Image: busybox from ext/system/busybox and this directory's /init,
 # which mounts the squashfs rootfs and switch_roots into it. Firmware and
-# modules live in the rootfs (tools/build_rootfs.sh).
+# modules live in the rootfs (tools/build_rootfs.sh), except the pm_sys CM4
+# images: its remoteproc is built in and boots itself at probe, before the
+# rootfs is up, so they ride in here too.
 #
 # Output: $OUT_DIR/root (default build/initramfs/root). Nothing generated is
 # written under system/initramfs.
@@ -49,5 +51,10 @@ ln -sf bin/busybox "$ROOT_DIR/linuxrc"
 cp "$SRC_DIR/init" "$ROOT_DIR/init"
 chmod +x "$ROOT_DIR/init"
 install -m 0755 "$SRC_DIR/usb-gadget" "$ROOT_DIR/sbin/usb-gadget"
+
+# the CM4 boot stub and pm_sys firmware, for sprd_pmsys at probe (the rootfs
+# keeps its own copy, which the firmware cache re-reads across suspend)
+mkdir -p "$ROOT_DIR/lib/firmware"
+cp -a "$REPO_ROOT/system/prebuilts/firmware/sprd" "$ROOT_DIR/lib/firmware/"
 
 echo "Built: $ROOT_DIR"

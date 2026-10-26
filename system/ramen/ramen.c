@@ -1028,24 +1028,90 @@ static bool ramen_read_line(const char *path, char *buf, size_t len)
    return ok;
 }
 
+static long ramen_read_long(const char *path)
+{
+   char buf[32];
+
+   return ramen_read_line(path, buf, sizeof(buf)) ? atol(buf) : -1;
+}
+
+/*
+ * The gauge re-derives its percentage from the open-circuit voltage, so a
+ * battery the charger has just called Full reads ~95%, and unplugging it
+ * dropped the vial straight there. Instead, while the charger says Full,
+ * show 100% and note the coulomb counter; on battery, count down from 100 by
+ * what has really been drained (charge_now and the gauge's own capacity,
+ * both uAh) until that meets the gauge, which then takes over. On battery
+ * the number never goes up: the OCV recovers a little at rest. Kept outside
+ * the handle, which RetroArch can rebuild.
+ */
+static struct
+{
+   bool counting;
+   bool topping_up;	/* Charging straight after Full, still on the cable */
+   long full_uah;
+   int  shown;
+} ramen_bat = { false, false, 0, -1 };
+
+static int ramen_battery_pct(int gauge, const char *status)
+{
+   int pct = gauge;
+
+   if (string_is_equal(status, "Full"))
+   {
+      ramen_bat.counting   = true;
+      ramen_bat.topping_up = true;
+      ramen_bat.full_uah   = ramen_read_long(RAMEN_FGU_PATH "/charge_now");
+      ramen_bat.shown      = 100;
+      return 100;
+   }
+   /* a charger that called it Full tops up now and then: still full */
+   if (string_is_equal(status, "Charging") && ramen_bat.topping_up)
+      return 100;
+   ramen_bat.topping_up = false;
+   if (string_is_equal(status, "Charging") || gauge < 0)
+   {
+      ramen_bat.counting = false;
+      ramen_bat.shown    = gauge;
+      return gauge;
+   }
+
+   if (ramen_bat.counting)
+   {
+      long now = ramen_read_long(RAMEN_FGU_PATH "/charge_now");
+      long cap = ramen_read_long(RAMEN_FGU_PATH "/energy_full_design");
+
+      if (now >= 0 && cap > 0)
+      {
+         long left = 100 - (ramen_bat.full_uah - now) * 100 / cap;
+
+         if (left > gauge)
+            pct = (int)MIN(100, left);
+         else
+            ramen_bat.counting = false;
+      }
+      else
+         ramen_bat.counting = false;
+   }
+   if (ramen_bat.shown >= 0 && pct > ramen_bat.shown)
+      pct = ramen_bat.shown;
+   ramen_bat.shown = pct;
+   return pct;
+}
+
 /* While data is lent to the host (or unreadable) the volume keeps its last
  * value. */
 static void ramen_read_status(ramen_handle_t *rm)
 {
    char buf[32];
+   int gauge = -1;
 
    if (ramen_read_line(RAMEN_FGU_PATH "/capacity", buf, sizeof(buf)))
-      rm->bat_pct = MAX(0, MIN(100, atoi(buf)));
-   else
-      rm->bat_pct = -1;
-   rm->bat_charging = false;
-   if (ramen_read_line(RAMEN_CHARGER_PATH "/status", buf, sizeof(buf)))
-   {
-      rm->bat_charging = string_is_equal(buf, "Charging");
-      /* the charger has terminated: full, whatever the gauge thinks */
-      if (string_is_equal(buf, "Full"))
-         rm->bat_pct = 100;
-   }
+      gauge = MAX(0, MIN(100, atoi(buf)));
+   if (!ramen_read_line(RAMEN_CHARGER_PATH "/status", buf, sizeof(buf)))
+      buf[0] = '\0';
+   rm->bat_charging = string_is_equal(buf, "Charging");
+   rm->bat_pct      = ramen_battery_pct(gauge, buf);
    if (ramen_read_line(RAMEN_VOLUME_PATH, buf, sizeof(buf)))
       rm->vol = MAX(0, MIN(RAMEN_VOLUME_MAX, atoi(buf)));
 }

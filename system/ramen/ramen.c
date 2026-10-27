@@ -43,6 +43,7 @@
 #include <lists/string_list.h>
 #include <retro_miscellaneous.h>
 #include <retro_timers.h>
+#include <rthreads/rthreads.h>
 #include <string/stdstring.h>
 
 #include "../../config.h"
@@ -109,11 +110,15 @@ static const char *const ramen_roots[] = { "/data", RAMEN_SD_DIR };
 /* Box art, shown inside the game spheres: boxart/<game>.png or .jpg in
  * the game's own directory, centre-cropped square and resampled into one layer
  * of a texture array, so the shader can pick a sphere's art by index. The
- * cache holds the spheres around the selection, replacing the least
- * recently used. */
+ * cache holds the spheres around the selection and RAMEN_ART_AHEAD more
+ * past either end of the ring, replacing the least recently used. A
+ * worker thread does the decoding, so the game view never waits on it:
+ * the render thread hands it paths and uploads what comes back. */
 #define RAMEN_ART_DIR     "boxart"
 #define RAMEN_ART_SIZE    256
-#define RAMEN_ART_LAYERS  12
+#define RAMEN_ART_LAYERS  24
+#define RAMEN_ART_AHEAD   4
+#define RAMEN_ART_JOBS    32
 
 /* Tube radius and sphere radius as a fraction of the screen side. */
 #define RAMEN_TUBE_R      0.65f
@@ -423,15 +428,37 @@ typedef struct ramen_handle
    char  meta_last[64];
 
    /* Box art cache: which game each layer holds, whether a file was
-    * found, and when it was last drawn. */
+    * found (or is still being decoded), and when it was last drawn. */
    GLuint art_tex;
    struct
    {
       int sys, game;
       bool present;
+      bool pending;
       unsigned stamp;
    } art[RAMEN_ART_LAYERS];
    unsigned art_stamp;
+
+   /* The decoder thread and its jobs. A job goes QUEUED by the render
+    * thread, BUSY while the worker decodes, DONE for the render thread to
+    * upload and free. Everything but the decode runs under art_lock. A
+    * job carries the generation it was made in, so a rescan can drop
+    * whatever was in flight. */
+   sthread_t *art_thread;
+   slock_t   *art_lock;
+   scond_t   *art_cond;
+   bool       art_quit;
+   unsigned   art_gen;
+   unsigned   art_seq;
+   struct
+   {
+      enum { ART_FREE, ART_QUEUED, ART_BUSY, ART_DONE } state;
+      unsigned seq;      /* queue order */
+      unsigned gen;
+      int sys, game;
+      char path[PATH_MAX_LENGTH];
+      uint8_t *buf;      /* RGBA, or NULL for no art */
+   } art_jobs[RAMEN_ART_JOBS];
 
    float gintro;         /* seconds since the games began bursting out */
    float gintro_len;     /* when the last visible one has settled */
@@ -1473,7 +1500,20 @@ static void ramen_forget_data(ramen_handle_t *rm)
    }
    rm->meta_sys = rm->meta_game = -1;
    for (i = 0; i < RAMEN_ART_LAYERS; i++)
-      rm->art[i].sys = -1;
+   {
+      rm->art[i].sys     = -1;
+      rm->art[i].pending = false;
+   }
+   /* the decoder's queue goes too; what it is on now is dropped on return */
+   if (rm->art_thread)
+   {
+      slock_lock(rm->art_lock);
+      rm->art_gen++;
+      for (i = 0; i < RAMEN_ART_JOBS; i++)
+         if (rm->art_jobs[i].state == ART_QUEUED)
+            rm->art_jobs[i].state = ART_FREE;
+      slock_unlock(rm->art_lock);
+   }
    rm->game = 0;
 
    /* The user's cores and BIOS may have come or gone too. The wheel stays
@@ -1700,65 +1740,228 @@ static void ramen_art_resample(const struct texture_image *img,
    }
 }
 
-/* Loads a game's art into the least recently used layer. A game with no
- * art file takes a layer too, marked absent, so it is not retried. */
-static void ramen_art_load(ramen_handle_t *rm, int sys, int game)
+/* The worker: decodes one job at a time into a RAMEN_ART_SIZE square. */
+static void ramen_art_worker(void *data)
+{
+   ramen_handle_t *rm = (ramen_handle_t*)data;
+
+   slock_lock(rm->art_lock);
+   for (;;)
+   {
+      struct texture_image img;
+      uint8_t *buf = NULL;
+      int k, job = -1;
+
+      for (k = 0; k < RAMEN_ART_JOBS; k++)
+         if (rm->art_jobs[k].state == ART_QUEUED
+               && (job < 0 || rm->art_jobs[k].seq < rm->art_jobs[job].seq))
+            job = k;
+      if (job < 0)
+      {
+         if (rm->art_quit)
+            break;
+         scond_wait(rm->art_cond, rm->art_lock);
+         continue;
+      }
+      rm->art_jobs[job].state = ART_BUSY;
+      slock_unlock(rm->art_lock);
+
+      memset(&img, 0, sizeof(img));
+      if (image_texture_load(&img, rm->art_jobs[job].path) && img.pixels
+            && img.width && img.height
+            && (buf = (uint8_t*)malloc(RAMEN_ART_SIZE * RAMEN_ART_SIZE * 4)))
+         ramen_art_resample(&img, buf);
+      image_texture_free(&img);
+
+      slock_lock(rm->art_lock);
+      rm->art_jobs[job].buf   = buf;
+      rm->art_jobs[job].state = ART_DONE;
+   }
+   slock_unlock(rm->art_lock);
+}
+
+static void ramen_art_start(ramen_handle_t *rm)
+{
+   rm->art_lock = slock_new();
+   rm->art_cond = scond_new();
+   if (rm->art_lock && rm->art_cond)
+      rm->art_thread = sthread_create(ramen_art_worker, rm);
+   if (!rm->art_thread)
+      RARCH_WARN("[ramen] no art decoder thread, art is off\n");
+}
+
+static void ramen_art_stop(ramen_handle_t *rm)
+{
+   int k;
+
+   if (rm->art_thread)
+   {
+      slock_lock(rm->art_lock);
+      rm->art_quit = true;
+      scond_signal(rm->art_cond);
+      slock_unlock(rm->art_lock);
+      sthread_join(rm->art_thread);
+   }
+   for (k = 0; k < RAMEN_ART_JOBS; k++)
+      free(rm->art_jobs[k].buf);
+   if (rm->art_cond)
+      scond_free(rm->art_cond);
+   if (rm->art_lock)
+      slock_free(rm->art_lock);
+   rm->art_thread = NULL;
+   rm->art_cond   = NULL;
+   rm->art_lock   = NULL;
+}
+
+/* The art file for a game, if there is one. */
+static bool ramen_art_path(ramen_handle_t *rm, int sys, int game,
+      char *path, size_t len)
 {
    static const char *exts[] = { "png", "jpg", "jpeg" };
    const char *rom = ramen_game_path(rm, sys, game);
-   struct texture_image img;
    char dir[PATH_MAX_LENGTH];
    char base[256];
    char name[300];
-   char path[PATH_MAX_LENGTH];
-   int k, lru = 0;
    size_t e;
 
    if (!rom)
-      return;
-   for (k = 1; k < RAMEN_ART_LAYERS; k++)
-      if (rm->art[k].stamp < rm->art[lru].stamp)
-         lru = k;
-   rm->art[lru].sys     = sys;
-   rm->art[lru].game    = game;
-   rm->art[lru].present = false;
-   rm->art[lru].stamp   = ++rm->art_stamp;
-
-   fill_pathname_basedir(path, rom, sizeof(path));
+      return false;
+   fill_pathname_basedir(path, rom, len);
    fill_pathname_join_special(dir, path, RAMEN_ART_DIR, sizeof(dir));
    fill_pathname_base(base, rom, sizeof(base));
    path_remove_extension(base);
-   memset(&img, 0, sizeof(img));
    for (e = 0; e < ARRAY_SIZE(exts); e++)
    {
       snprintf(name, sizeof(name), "%s.%s", base, exts[e]);
-      fill_pathname_join_special(path, dir, name, sizeof(path));
-      if (!path_is_valid(path))
-         continue;
-      if (image_texture_load(&img, path) && img.pixels
-            && img.width && img.height)
-         break;
-      image_texture_free(&img);
-      memset(&img, 0, sizeof(img));
+      fill_pathname_join_special(path, dir, name, len);
+      if (path_is_valid(path))
+         return true;
    }
-   if (!img.pixels)
-      return;
+   return false;
+}
 
+/* Claims the least recently used layer for a game and queues its decode.
+ * A game with no art file takes a layer too, marked absent, so it is not
+ * retried. Returns false if the queue is full, to try again next frame. */
+static bool ramen_art_request(ramen_handle_t *rm, int sys, int game)
+{
+   char path[PATH_MAX_LENGTH];
+   int k, lru = 0, job = -1;
+
+   if (!rm->art_thread)
+      return true;
+   for (k = 1; k < RAMEN_ART_LAYERS; k++)
+      if (rm->art[k].stamp < rm->art[lru].stamp)
+         lru = k;
+   if (!ramen_art_path(rm, sys, game, path, sizeof(path)))
    {
-      uint8_t *buf = (uint8_t*)malloc(RAMEN_ART_SIZE * RAMEN_ART_SIZE * 4);
-      if (buf)
+      rm->art[lru].sys     = sys;
+      rm->art[lru].game    = game;
+      rm->art[lru].present = false;
+      rm->art[lru].pending = false;
+      rm->art[lru].stamp   = ++rm->art_stamp;
+      return true;
+   }
+
+   slock_lock(rm->art_lock);
+   for (k = 0; k < RAMEN_ART_JOBS; k++)
+      if (rm->art_jobs[k].state == ART_FREE)
       {
-         ramen_art_resample(&img, buf);
-         glBindTexture(GL_TEXTURE_2D_ARRAY, rm->art_tex);
-         glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, lru,
-               RAMEN_ART_SIZE, RAMEN_ART_SIZE, 1, GL_RGBA, GL_UNSIGNED_BYTE,
-               buf);
-         glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
-         free(buf);
-         rm->art[lru].present = true;
+         job = k;
+         break;
+      }
+   if (job >= 0)
+   {
+      rm->art_jobs[job].state = ART_QUEUED;
+      rm->art_jobs[job].seq   = ++rm->art_seq;
+      rm->art_jobs[job].gen   = rm->art_gen;
+      rm->art_jobs[job].sys   = sys;
+      rm->art_jobs[job].game  = game;
+      rm->art_jobs[job].buf   = NULL;
+      strlcpy(rm->art_jobs[job].path, path, sizeof(rm->art_jobs[job].path));
+      scond_signal(rm->art_cond);
+   }
+   slock_unlock(rm->art_lock);
+   if (job < 0)
+      return false;
+
+   rm->art[lru].sys     = sys;
+   rm->art[lru].game    = game;
+   rm->art[lru].present = false;
+   rm->art[lru].pending = true;
+   rm->art[lru].stamp   = ++rm->art_stamp;
+   return true;
+}
+
+/* Uploads what the worker has finished. A result whose layer has since
+ * been given to another game, or that predates a rescan, is dropped. */
+static void ramen_art_drain(ramen_handle_t *rm)
+{
+   int k;
+
+   if (!rm->art_thread)
+      return;
+   slock_lock(rm->art_lock);
+   for (k = 0; k < RAMEN_ART_JOBS; k++)
+   {
+      int l;
+
+      if (rm->art_jobs[k].state != ART_DONE)
+         continue;
+      if (rm->art_jobs[k].gen == rm->art_gen && rm->gl_ready)
+         for (l = 0; l < RAMEN_ART_LAYERS; l++)
+         {
+            if (!rm->art[l].pending || rm->art[l].sys != rm->art_jobs[k].sys
+                  || rm->art[l].game != rm->art_jobs[k].game)
+               continue;
+            rm->art[l].pending = false;
+            if (rm->art_jobs[k].buf)
+            {
+               glBindTexture(GL_TEXTURE_2D_ARRAY, rm->art_tex);
+               glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, l,
+                     RAMEN_ART_SIZE, RAMEN_ART_SIZE, 1, GL_RGBA,
+                     GL_UNSIGNED_BYTE, rm->art_jobs[k].buf);
+               glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+               rm->art[l].present = true;
+            }
+         }
+      free(rm->art_jobs[k].buf);
+      rm->art_jobs[k].buf   = NULL;
+      rm->art_jobs[k].state = ART_FREE;
+   }
+   slock_unlock(rm->art_lock);
+}
+
+/* Asks for the art of the games around the selection: the ring that is
+ * drawn (relative index -last..1) and RAMEN_ART_AHEAD past either end,
+ * nearest first, so a sphere has its art by the time it surfaces. */
+static void ramen_art_prefetch(ramen_handle_t *rm)
+{
+   int n    = (int)ramen_game_count(rm, rm->system);
+   int last = MIN(n, RAMEN_GAMES_MAX);
+   int lo   = -last - RAMEN_ART_AHEAD;
+   int hi   = 1 + RAMEN_ART_AHEAD;
+   int want = MIN(hi - lo + 1, n);   /* distinct games in the window */
+   int d, seen = 0;
+
+   for (d = 0; seen < want; d++)
+   {
+      int sign;
+      for (sign = -1; sign <= 1 && seen < want; sign += 2)
+      {
+         int i = d * sign;
+         int idx;
+
+         if (i < lo || i > hi || (d == 0 && sign > 0))
+            continue;
+         seen++;
+         idx = ((rm->game + i) % n + n) % n;
+         if (ramen_art_find(rm, rm->system, idx) >= 0)
+            continue;
+         if (!ramen_art_request(rm, rm->system, idx))
+            return;
       }
    }
-   image_texture_free(&img);
 }
 
 /* The play time and last-played date of the selected game, out of
@@ -2609,6 +2812,7 @@ static void *ramen_init(void **userdata, bool video_is_threaded)
    ramen_scan_systems(rm);
    ramen_begin_boot_spin(rm, ramen_load_last_system(rm));
    ramen_snd_load();   /* audio is up before the menu driver */
+   ramen_art_start(rm);
    return menu;
 }
 
@@ -2623,6 +2827,7 @@ static void ramen_free(void *data)
    if (!rm)
       return;
    ramen_saver(rm, false);
+   ramen_art_stop(rm);
    if (rm->font)
       font_driver_free(rm->font);
    rm->font = NULL;
@@ -2712,8 +2917,6 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    float alphas[RAMEN_MAX_SPHERES];
    float arts[RAMEN_MAX_SPHERES];
    int count            = 0;
-   int want_sys         = -1;
-   int want_game        = -1;
    int selected_slot;
    float clear, launch_deg, cam_target, dt;
    float mon_rect[4];
@@ -2728,6 +2931,7 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
       return;
 
    ramen_update(rm, cpu_features_get_time_usec());
+   ramen_art_drain(rm);
    dt            = rm->dt;
    mon_rect[0]   = pivot[0] + RAMEN_MON_X * S;
    mon_rect[1]   = pivot[1] - RAMEN_MON_Y * S;
@@ -2872,18 +3076,12 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
          if (a <= 0.0f)
             continue;
          {
-            /* the game this sphere is, and its art if cached; one missing
-             * one is decoded per frame, after the draw, so the hitch is
-             * spread out rather than taken all at once */
+            /* the game this sphere is, and its art if it has arrived;
+             * ramen_art_prefetch asks for what is missing */
             int idx   = ((rm->game + i) % n + n) % n;
             int layer = ramen_art_find(rm, rm->system, idx);
             arts[count] = (layer >= 0 && rm->art[layer].present)
                         ? (float)layer : -1.0f;
-            if (layer < 0 && want_game < 0)
-            {
-               want_sys  = rm->system;
-               want_game = idx;
-            }
          }
          alphas[count]     = a;
          spheres[count][0] = deg * (float)M_PI / 180.0f;
@@ -2998,8 +3196,8 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
    glBindVertexArray(0);
    glUseProgram(0);
 
-   if (want_game >= 0)
-      ramen_art_load(rm, want_sys, want_game);
+   if (rm->state == RAMEN_GAME || rm->state == RAMEN_STARTING)
+      ramen_art_prefetch(rm);
 
    /* Text. The font driver binds its own program and blend state. */
    if (rm->font && rm->fade > 0.0f)
@@ -3489,6 +3687,7 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
                rm->gslot = ramen_game_slot(ramen_game_count(rm, rm->system));
                if ((unsigned)rm->game >= ramen_game_count(rm, rm->system))
                   rm->game = 0;
+               ramen_art_prefetch(rm);   /* a head start on the burst */
                /* the intro lasts until the last sphere that can be seen,
                 * the one nearest the bottom edge, has settled */
                {

@@ -1044,7 +1044,10 @@ static void ramen_snd_play(enum ramen_sound which)
    }
    if (audio_driver_mixer_get_stream_state(which) == AUDIO_STREAM_STATE_NONE)
       ramen_snd_load();
-   audio_driver_mixer_play_stream(which);
+   /* The menu-sound path keeps the stream once the cue has finished.
+    * The plain one tears it down, and reloading every cue on the next
+    * play of that slot stalled a frame every third tick. */
+   audio_driver_mixer_play_menu_sound(which);
 }
 
 /* ---- battery and volume ------------------------------------------------ */
@@ -2605,6 +2608,7 @@ static void *ramen_init(void **userdata, bool video_is_threaded)
    ramen_link_bios();
    ramen_scan_systems(rm);
    ramen_begin_boot_spin(rm, ramen_load_last_system(rm));
+   ramen_snd_load();   /* audio is up before the menu driver */
    return menu;
 }
 

@@ -23,6 +23,7 @@
  */
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +32,8 @@
 #include <strings.h>
 #include <time.h>
 #include <unistd.h>
+#include <linux/input.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 
 #include <compat/strl.h>
@@ -286,6 +289,44 @@ enum ramen_sound
 #define RAMEN_PIVOT_X     1.0f
 #define RAMEN_PIVOT_Y     1.0f
 
+/* Touch: the panel is read straight from evdev (RetroArch's menu pointer
+ * never gets a position out of its udev touch code). A finger on the tube
+ * turns the wheel it is on by the angle it sweeps about the pivot; letting
+ * go flings it by the last velocity and the detent spring takes over. A
+ * finger that sweeps less than TAP_DEG taps: the selected sphere confirms,
+ * a neighbour is pulled in. Too close to the pivot the angle is noise. */
+#define RAMEN_TOUCH_TAP_DEG   2.5f
+#define RAMEN_TOUCH_FLING_S   0.12f   /* the systems' look-ahead */
+#define RAMEN_TOUCH_MAX_STEPS 3       /* the systems' wheel: it repeats */
+/* The games' ring is long, so a flick there coasts under friction
+ * instead, ticking past games until it is slow enough for the spring. */
+#define RAMEN_GAME_FRICTION   3.0f    /* 1/s */
+#define RAMEN_GAME_COAST_MIN  70.0f   /* deg/s: below this the spring */
+#define RAMEN_GAME_COAST_MAX  1500.0f /* deg/s */
+#define RAMEN_TOUCH_MIN_R     0.2f    /* of S, from the pivot */
+#define RAMEN_TOUCH_BAND      1.5f    /* of a sphere radius, off the tube */
+
+/* Motion: the accelerometer through its IIO buffer. The spheres have
+ * inertia: a jolt of the device leaves them behind, so the part of the
+ * acceleration along the tube at the selected slot kicks the wheel the
+ * other way, and the spring brings it back. Gravity is a slow average and
+ * does not count (a tilt must not pull the wheel off its detent). The
+ * kick is capped well under half a slot so it can never change the
+ * selection. Which device axis is which way on screen is set here; the
+ * hub's mount matrix is the identity. */
+#define RAMEN_IMU_NAME      "sprd-shub-accel"
+#define RAMEN_IMU_HZ        50
+#define RAMEN_IMU_AXIS_X    0       /* device axis along the screen's x */
+#define RAMEN_IMU_AXIS_Y    1       /* device axis along the screen's y */
+#define RAMEN_IMU_SIGN_X    1.0f    /* +1: that axis grows to the right */
+#define RAMEN_IMU_SIGN_Y    1.0f    /* +1: that axis grows upward */
+#define RAMEN_IMU_SCALE     (1.0f / 256.0f)
+#define RAMEN_IMU_G_TAU     0.8f    /* seconds, the gravity average */
+#define RAMEN_IMU_DEAD      0.35f   /* m/s^2 of noise to ignore */
+#define RAMEN_IMU_KICK      260.0f  /* deg/s^2 per m/s^2 */
+#define RAMEN_IMU_VMAX      220.0f  /* deg/s, the systems' wheel */
+#define RAMEN_IMU_GVMAX     110.0f  /* deg/s, the games' */
+
 static const struct
 {
    const char *name;
@@ -459,6 +500,45 @@ typedef struct ramen_handle
       char path[PATH_MAX_LENGTH];
       uint8_t *buf;      /* RGBA, or NULL for no art */
    } art_jobs[RAMEN_ART_JOBS];
+
+   /* The touch panel: its evdev node and ranges, the finger as reported
+    * (committed on each SYN), and the drag it drives: 0 none, 1 the
+    * systems' wheel, 2 the games'; the wheel when it began, the angle
+    * swept since (unwrapped), the last angle seen, the velocity, and
+    * whether it has moved past a tap. */
+   int   touch_fd;
+   int   touch_max_x;
+   int   touch_max_y;
+   int   touch_raw_x;
+   int   touch_raw_y;
+   bool  touch_raw_down;
+   bool  touch_down;
+   float touch_x;        /* screen px */
+   float touch_y;
+   int   drag;
+   float drag_w0;
+   float drag_acc;
+   float drag_last;
+   float drag_vel;
+   bool  drag_moved;
+   bool  gcoast;         /* the games' ring is coasting after a flick */
+
+   /* The camera as last drawn: the pivot on screen, the zoom, the pivot
+    * and S in world px, and the screen size. Touches map through it. */
+   float cam_ps[2];
+   float cam_zoom;
+   float cam_pivot[2];
+   float cam_s;
+   unsigned cam_w;
+   unsigned cam_h;
+
+   /* The accelerometer: its buffer device and sysfs dir, whether the
+    * stream is on, and the gravity average. */
+   int   imu_fd;
+   char  imu_sysfs[96];
+   bool  imu_on;
+   bool  imu_have_g;
+   float imu_g[3];
 
    float gintro;         /* seconds since the games began bursting out */
    float gintro_len;     /* when the last visible one has settled */
@@ -1240,6 +1320,7 @@ static void ramen_notice(ramen_handle_t *rm, const char *msg, float secs)
 /* ---- systems --------------------------------------------------------- */
 
 static int ramen_selected_system(ramen_handle_t *rm);
+static void ramen_saver(ramen_handle_t *rm, bool on);
 
 /* Adds a ROM directory to a system unless it has it already. */
 static void ramen_sys_add_dir(ramen_system_t *s, const char *dir)
@@ -2149,10 +2230,457 @@ static void ramen_game_step(ramen_handle_t *rm, int dir)
 
    if (n == 0)
       return;
+   rm->gcoast = false;
    rm->game = ((rm->game + dir) % n + n) % n;
    rm->gwheel_target += dir * rm->gslot;
    rm->gsettled       = false;
    ramen_snd_play(SND_TICK);
+}
+
+static int ramen_entry_action(void *userdata, menu_entry_t *entry,
+      size_t i, enum menu_action action);
+
+/* ---- the touch panel -------------------------------------------------- */
+
+static void ramen_touch_open(ramen_handle_t *rm)
+{
+   int i;
+
+   rm->touch_fd = -1;
+   for (i = 0; i < 32; i++)
+   {
+      char path[32];
+      uint8_t evbits[(EV_MAX + 7) / 8];
+      uint8_t absbits[(ABS_MAX + 7) / 8];
+      struct input_absinfo ax, ay;
+      int fd;
+
+      snprintf(path, sizeof(path), "/dev/input/event%d", i);
+      fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+      if (fd < 0)
+         continue;
+      memset(evbits, 0, sizeof(evbits));
+      memset(absbits, 0, sizeof(absbits));
+      if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) < 0
+            || !(evbits[EV_ABS / 8] & (1 << (EV_ABS % 8)))
+            || ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) < 0
+            || !(absbits[ABS_MT_POSITION_X / 8] & (1 << (ABS_MT_POSITION_X % 8)))
+            || ioctl(fd, EVIOCGABS(ABS_X), &ax) < 0
+            || ioctl(fd, EVIOCGABS(ABS_Y), &ay) < 0)
+      {
+         close(fd);
+         continue;
+      }
+      rm->touch_fd    = fd;
+      rm->touch_max_x = ax.maximum > 0 ? ax.maximum : 1;
+      rm->touch_max_y = ay.maximum > 0 ? ay.maximum : 1;
+      RARCH_LOG("[ramen] touch: %s, %dx%d\n", path,
+            rm->touch_max_x + 1, rm->touch_max_y + 1);
+      return;
+   }
+}
+
+/* The finger in the world: its angle about the pivot in the spheres'
+ * convention (degrees), and its distance from it in units of S. */
+static bool ramen_touch_world(ramen_handle_t *rm, float *deg, float *dist)
+{
+   float wx, wy, dx, dy;
+
+   if (!rm->cam_w || rm->cam_zoom <= 0.0f || rm->cam_s <= 0.0f)
+      return false;
+   wx    = rm->cam_pivot[0] + (rm->touch_x - rm->cam_ps[0]) / rm->cam_zoom;
+   wy    = rm->cam_pivot[1] + (rm->touch_y - rm->cam_ps[1]) / rm->cam_zoom;
+   dx    = rm->cam_pivot[0] - wx;
+   dy    = rm->cam_pivot[1] - wy;
+   *dist = sqrtf(dx * dx + dy * dy) / rm->cam_s;
+   *deg  = atan2f(dy, dx) * 180.0f / (float)M_PI;
+   return *dist > RAMEN_TOUCH_MIN_R;
+}
+
+/* The angular half-width of a sphere of the given scale on the tube. */
+static float ramen_sphere_deg(float scale)
+{
+   float r = RAMEN_SPHERE_R * scale / RAMEN_TUBE_R;
+   return asinf(MIN(1.0f, r)) * 180.0f / (float)M_PI;
+}
+
+static void ramen_touch_down(ramen_handle_t *rm)
+{
+   float deg, dist;
+
+   rm->drag = 0;
+   if (rm->usb_req || rm->launch > 0.0f)
+      return;
+   if (!ramen_touch_world(rm, &deg, &dist))
+      return;
+   if (rm->state == RAMEN_SYSTEM)
+   {
+      if (rm->boot_spin)
+         ramen_snap(rm);
+      rm->drag    = 1;
+      rm->drag_w0 = rm->wheel;
+   }
+   else if (rm->state == RAMEN_GAME && rm->gintro >= rm->gintro_len)
+   {
+      rm->drag    = 2;
+      rm->drag_w0 = rm->gwheel;
+      rm->gcoast  = false;   /* caught */
+      rm->gwheel_vel = 0.0f;
+   }
+   else
+      return;
+   rm->drag_acc   = 0.0f;
+   rm->drag_last  = deg;
+   rm->drag_vel   = 0.0f;
+   rm->drag_moved = false;
+}
+
+/* Turn the games' ring by whole slots, keeping the index in step. */
+static void ramen_game_turn(ramen_handle_t *rm, int steps)
+{
+   int n = (int)ramen_game_count(rm, rm->system);
+
+   if (n == 0 || steps == 0)
+      return;
+   rm->game           = ((rm->game + steps) % n + n) % n;
+   rm->gwheel_target += steps * rm->gslot;
+   rm->gsettled       = false;
+   ramen_snd_play(SND_TICK);
+}
+
+/* The finger is down and moving: the wheel follows it. */
+static void ramen_drag_update(ramen_handle_t *rm, float dt)
+{
+   float deg, dist, w, vel;
+
+   if (!rm->drag || !rm->touch_down)
+      return;
+   if ((rm->drag == 1 && rm->state != RAMEN_SYSTEM)
+         || (rm->drag == 2 && rm->state != RAMEN_GAME))
+   {
+      rm->drag = 0;
+      return;
+   }
+   if (!ramen_touch_world(rm, &deg, &dist))
+      return;   /* at the pivot: hold still */
+   while (deg - rm->drag_last > 180.0f)
+      deg -= 360.0f;
+   while (deg - rm->drag_last < -180.0f)
+      deg += 360.0f;
+   rm->drag_acc += deg - rm->drag_last;
+   rm->drag_last = deg;
+   if (fabsf(rm->drag_acc) > RAMEN_TOUCH_TAP_DEG)
+      rm->drag_moved = true;
+   if (!rm->drag_moved)
+      return;
+
+   w   = rm->drag_w0 + rm->drag_acc;
+   vel = dt > 0.0f ? (w - (rm->drag == 1 ? rm->wheel : rm->gwheel)) / dt : 0.0f;
+   rm->drag_vel += (vel - rm->drag_vel) * MIN(1.0f, dt / 0.05f);
+
+   if (rm->drag == 1)
+   {
+      int slot = ramen_slot_at(w);
+      if (slot != ramen_slot_at(rm->wheel_target))
+         ramen_snd_play(SND_TICK);
+      rm->wheel        = w;
+      rm->wheel_vel    = rm->drag_vel;
+      rm->wheel_target = ramen_slot_target(slot);
+      rm->settled      = false;
+      rm->label        = 0.0f;
+   }
+   else
+   {
+      rm->gwheel     = w;
+      rm->gwheel_vel = rm->drag_vel;
+      rm->gsettled   = false;
+      /* past half a slot the ring steps, so the offset stays small and
+       * the drawn ring stays whole */
+      while (rm->gwheel - rm->gwheel_target > rm->gslot * 0.5f)
+         ramen_game_turn(rm, 1);
+      while (rm->gwheel - rm->gwheel_target < -rm->gslot * 0.5f)
+         ramen_game_turn(rm, -1);
+   }
+}
+
+static void ramen_touch_tap(ramen_handle_t *rm, int drag)
+{
+   float deg, dist;
+
+   if (!ramen_touch_world(rm, &deg, &dist))
+      return;
+   if (fabsf(dist - RAMEN_TUBE_R) > RAMEN_SPHERE_R * RAMEN_TOUCH_BAND)
+      return;
+   if (drag == 1)
+   {
+      int k = (int)lroundf((deg - rm->wheel) / RAMEN_SLOT_DEG);
+
+      if (fabsf(rm->wheel + k * RAMEN_SLOT_DEG - deg) > ramen_sphere_deg(1.15f))
+         return;
+      if (k == ramen_slot_at(rm->wheel_target))
+         ramen_entry_action(rm, NULL, 0, MENU_ACTION_OK);
+      else
+      {
+         rm->wheel_target = ramen_slot_target(k);
+         rm->settled      = false;
+         rm->label        = 0.0f;
+         ramen_snd_play(SND_TICK);
+      }
+   }
+   else
+   {
+      int n    = (int)ramen_game_count(rm, rm->system);
+      int last = MIN(n, RAMEN_GAMES_MAX);
+      float rel, hit;
+      int i;
+
+      /* the parked system sphere: back out */
+      if (fabsf(deg - RAMEN_PARK_DEG) < ramen_sphere_deg(1.15f))
+      {
+         ramen_entry_action(rm, NULL, 0, MENU_ACTION_CANCEL);
+         return;
+      }
+      if (n == 0)
+         return;
+      rel = RAMEN_GAME_DEG + (rm->gwheel - rm->gwheel_target) - deg;
+      i   = (int)lroundf(rel / rm->gslot);
+      hit = ramen_sphere_deg(RAMEN_GAME_SCALE * (i == 0 ? 1.15f : 1.0f));
+      if (i < -last || i > 0 || fabsf(rel - i * rm->gslot) > hit)
+         return;
+      if (i == 0)
+         ramen_entry_action(rm, NULL, 0, MENU_ACTION_OK);
+      else
+         ramen_game_turn(rm, i);
+   }
+}
+
+static void ramen_touch_up(ramen_handle_t *rm)
+{
+   int drag = rm->drag;
+
+   rm->drag = 0;
+   if (!drag)
+      return;
+   if ((drag == 1 && rm->state != RAMEN_SYSTEM)
+         || (drag == 2 && rm->state != RAMEN_GAME))
+      return;
+   if (!rm->drag_moved)
+   {
+      ramen_touch_tap(rm, drag);
+      return;
+   }
+   /* the fling: where the velocity would carry it, in slots */
+   if (drag == 1)
+   {
+      int cur = ramen_slot_at(rm->wheel);
+      int k   = ramen_slot_at(rm->wheel + rm->drag_vel * RAMEN_TOUCH_FLING_S);
+
+      k = MAX(cur - RAMEN_TOUCH_MAX_STEPS, MIN(cur + RAMEN_TOUCH_MAX_STEPS, k));
+      if (k != ramen_slot_at(rm->wheel_target))
+         ramen_snd_play(SND_TICK);
+      rm->wheel_target = ramen_slot_target(k);
+      rm->settled      = false;
+      rm->label        = 0.0f;
+   }
+   else
+   {
+      /* fast enough: coast; otherwise the spring takes it from here,
+       * landing on whichever slot the drag left it nearest */
+      if (fabsf(rm->drag_vel) >= RAMEN_GAME_COAST_MIN)
+      {
+         rm->gcoast     = true;
+         rm->gwheel_vel = MAX(-RAMEN_GAME_COAST_MAX,
+               MIN(RAMEN_GAME_COAST_MAX, rm->drag_vel));
+      }
+      rm->gsettled = false;
+   }
+}
+
+/* Drain the panel's events; a finger coming or going is handled on the
+ * SYN that reports it. Any touch counts as input to RetroArch, and the
+ * one that wakes the screensaver does nothing else. */
+static void ramen_touch_poll(ramen_handle_t *rm)
+{
+   struct input_event ev[32];
+   ssize_t n;
+
+   if (rm->touch_fd < 0)
+      return;
+   while ((n = read(rm->touch_fd, ev, sizeof(ev))) > 0)
+   {
+      size_t i, cnt = (size_t)n / sizeof(ev[0]);
+
+      for (i = 0; i < cnt; i++)
+      {
+         switch (ev[i].type)
+         {
+            case EV_ABS:
+               if (ev[i].code == ABS_X)
+                  rm->touch_raw_x = ev[i].value;
+               else if (ev[i].code == ABS_Y)
+                  rm->touch_raw_y = ev[i].value;
+               break;
+            case EV_KEY:
+               if (ev[i].code == BTN_TOUCH)
+                  rm->touch_raw_down = ev[i].value != 0;
+               break;
+            case EV_SYN:
+               if (ev[i].code != SYN_REPORT)
+                  break;
+               rm->touch_x = (float)rm->touch_raw_x * (float)rm->cam_w
+                           / (float)(rm->touch_max_x + 1);
+               rm->touch_y = (float)rm->touch_raw_y * (float)rm->cam_h
+                           / (float)(rm->touch_max_y + 1);
+               if (rm->touch_raw_down || rm->touch_down)
+                  menu_state_get_ptr()->input_last_time_us =
+                     cpu_features_get_time_usec();
+               if (rm->touch_raw_down == rm->touch_down)
+                  break;
+               rm->touch_down = rm->touch_raw_down;
+               if (!rm->touch_down)
+                  ramen_touch_up(rm);
+               else if (rm->saver)
+               {
+                  struct menu_state *menu_st = menu_state_get_ptr();
+                  menu_st->flags &= ~MENU_ST_FLAG_SCREENSAVER_ACTIVE;
+                  ramen_saver(rm, false);
+                  rm->drag = 0;
+               }
+               else
+                  ramen_touch_down(rm);
+               break;
+            default:
+               break;
+         }
+      }
+   }
+}
+
+/* ---- the accelerometer ------------------------------------------------ */
+
+static bool ramen_write_str(const char *path, const char *val)
+{
+   FILE *f = fopen(path, "w");
+
+   if (!f)
+      return false;
+   fputs(val, f);
+   return fclose(f) == 0;
+}
+
+static bool ramen_imu_write(ramen_handle_t *rm, const char *attr,
+      const char *val)
+{
+   char path[160];
+
+   snprintf(path, sizeof(path), "%s/%s", rm->imu_sysfs, attr);
+   return ramen_write_str(path, val);
+}
+
+static void ramen_imu_open(ramen_handle_t *rm)
+{
+   int i;
+
+   rm->imu_fd = -1;
+   for (i = 0; i < 16; i++)
+   {
+      char path[160], name[64], hz[16];
+
+      snprintf(rm->imu_sysfs, sizeof(rm->imu_sysfs),
+            "/sys/bus/iio/devices/iio:device%d", i);
+      snprintf(path, sizeof(path), "%s/name", rm->imu_sysfs);
+      if (!ramen_read_line(path, name, sizeof(name))
+            || !string_is_equal(name, RAMEN_IMU_NAME))
+         continue;
+      snprintf(hz, sizeof(hz), "%d", RAMEN_IMU_HZ);
+      ramen_imu_write(rm, "buffer/enable", "0");
+      if (!ramen_imu_write(rm, "scan_elements/in_accel_x_en", "1")
+            || !ramen_imu_write(rm, "scan_elements/in_accel_y_en", "1")
+            || !ramen_imu_write(rm, "scan_elements/in_accel_z_en", "1")
+            || !ramen_imu_write(rm, "scan_elements/in_timestamp_en", "0")
+            || !ramen_imu_write(rm, "buffer/length", "64")
+            || !ramen_imu_write(rm, "in_accel_sampling_frequency", hz))
+      {
+         RARCH_WARN("[ramen] accelerometer: cannot set up %s\n", rm->imu_sysfs);
+         break;
+      }
+      snprintf(path, sizeof(path), "/dev/iio:device%d", i);
+      rm->imu_fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+      if (rm->imu_fd < 0)
+         RARCH_WARN("[ramen] accelerometer: cannot open %s\n", path);
+      else
+         RARCH_LOG("[ramen] accelerometer: %s\n", path);
+      return;
+   }
+   rm->imu_sysfs[0] = '\0';
+}
+
+/* Start or stop the stream: it runs on the hub, so it is off whenever
+ * nothing would show it. */
+static void ramen_imu_set(ramen_handle_t *rm, bool on)
+{
+   if (rm->imu_fd < 0 || rm->imu_on == on)
+      return;
+   ramen_imu_write(rm, "buffer/enable", on ? "1" : "0");
+   rm->imu_on     = on;
+   rm->imu_have_g = false;
+}
+
+static void ramen_imu_poll(ramen_handle_t *rm)
+{
+   int32_t rec[64][3];
+   ssize_t n;
+   float kick    = 0.0f;
+   const float sdt = 1.0f / (float)RAMEN_IMU_HZ;
+   float ang;
+
+   if (rm->imu_fd < 0 || !rm->imu_on)
+      return;
+   /* the tube's tangent at the selected slot, screen y down */
+   ang = (rm->state == RAMEN_GAME ? RAMEN_GAME_DEG : RAMEN_SELECT_DEG)
+       * (float)M_PI / 180.0f;
+   while ((n = read(rm->imu_fd, rec, sizeof(rec))) > 0)
+   {
+      size_t i, cnt = (size_t)n / sizeof(rec[0]);
+
+      for (i = 0; i < cnt; i++)
+      {
+         float a[3], d[3], sx, sy, at;
+         int k;
+
+         for (k = 0; k < 3; k++)
+            a[k] = (float)rec[i][k] * RAMEN_IMU_SCALE;
+         if (!rm->imu_have_g)
+         {
+            memcpy(rm->imu_g, a, sizeof(a));
+            rm->imu_have_g = true;
+            continue;
+         }
+         for (k = 0; k < 3; k++)
+         {
+            rm->imu_g[k] += (a[k] - rm->imu_g[k]) * MIN(1.0f, sdt / RAMEN_IMU_G_TAU);
+            d[k]          = a[k] - rm->imu_g[k];
+         }
+         sx = RAMEN_IMU_SIGN_X * d[RAMEN_IMU_AXIS_X];   /* screen right */
+         sy = RAMEN_IMU_SIGN_Y * d[RAMEN_IMU_AXIS_Y];   /* screen up */
+         /* along the tangent of increasing angle: (sin a, -cos a) with
+          * y down, so up is -y */
+         at = sx * sinf(ang) + sy * cosf(ang);
+         if (fabsf(at) < RAMEN_IMU_DEAD)
+            continue;
+         at   -= (at > 0.0f ? RAMEN_IMU_DEAD : -RAMEN_IMU_DEAD);
+         kick -= at * RAMEN_IMU_KICK * sdt;   /* the spheres lag behind */
+      }
+   }
+   if (kick == 0.0f || rm->drag || rm->gcoast || rm->usb_req
+         || rm->launch > 0.0f)
+      return;
+   if (rm->state == RAMEN_SYSTEM && !rm->boot_spin)
+      rm->wheel_vel = MAX(-RAMEN_IMU_VMAX,
+            MIN(RAMEN_IMU_VMAX, rm->wheel_vel + kick));
+   else if (rm->state == RAMEN_GAME && rm->gintro >= rm->gintro_len)
+      rm->gwheel_vel = MAX(-RAMEN_IMU_GVMAX,
+            MIN(RAMEN_IMU_GVMAX, rm->gwheel_vel + kick * 0.6f));
 }
 
 /* The in-game page is drawn once the raster is open and a degauss has
@@ -2175,6 +2703,10 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
       dt = 0.05f;
    rm->dt = dt;
 
+   ramen_touch_poll(rm);
+   ramen_drag_update(rm, dt);
+   ramen_imu_poll(rm);
+
    if (rm->boot_spin)
    {
       int slot;
@@ -2191,7 +2723,7 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
       if (rm->wheel_vel < 75.0f)
          rm->boot_spin = false;
    }
-   else
+   else if (rm->drag != 1)
    {
       ramen_spring(&rm->wheel, &rm->wheel_vel, rm->wheel_target,
             RAMEN_SPRING_HZ, RAMEN_SPRING_ZETA, dt);
@@ -2245,9 +2777,21 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
          || rm->state == RAMEN_STARTING)
       rm->gintro += dt;
 
-   /* The game queue's own detent spring. */
-   ramen_spring(&rm->gwheel, &rm->gwheel_vel, rm->gwheel_target,
-         RAMEN_SPRING_HZ, RAMEN_SPRING_ZETA, dt);
+   /* The game queue: coasting after a flick, else its own detent spring. */
+   if (rm->gcoast)
+   {
+      rm->gwheel_vel *= expf(-RAMEN_GAME_FRICTION * dt);
+      rm->gwheel     += rm->gwheel_vel * dt;
+      while (rm->gwheel - rm->gwheel_target > rm->gslot * 0.5f)
+         ramen_game_turn(rm, 1);
+      while (rm->gwheel - rm->gwheel_target < -rm->gslot * 0.5f)
+         ramen_game_turn(rm, -1);
+      if (fabsf(rm->gwheel_vel) < RAMEN_GAME_COAST_MIN)
+         rm->gcoast = false;
+   }
+   else if (rm->drag != 2)
+      ramen_spring(&rm->gwheel, &rm->gwheel_vel, rm->gwheel_target,
+            RAMEN_SPRING_HZ, RAMEN_SPRING_ZETA, dt);
    if (fabsf(rm->gwheel_target - rm->gwheel) < 0.3f
          && fabsf(rm->gwheel_vel) < 8.0f && !rm->gsettled)
    {
@@ -2800,6 +3344,8 @@ static void *ramen_init(void **userdata, bool video_is_threaded)
    rm->ig_h       = 1.0f;
    rm->bat_pct    = -1;
    rm->vol        = -1;
+   ramen_touch_open(rm);
+   ramen_imu_open(rm);
    /* A config from before the links still names /data/bios. */
    {
       settings_t *settings = config_get_ptr();
@@ -2827,6 +3373,12 @@ static void ramen_free(void *data)
    if (!rm)
       return;
    ramen_saver(rm, false);
+   ramen_imu_set(rm, false);
+   if (rm->imu_fd >= 0)
+      close(rm->imu_fd);
+   if (rm->touch_fd >= 0)
+      close(rm->touch_fd);
+   rm->imu_fd = rm->touch_fd = -1;
    ramen_art_stop(rm);
    if (rm->font)
       font_driver_free(rm->font);
@@ -2971,6 +3523,18 @@ static void ramen_frame(void *data, video_frame_info_t *video_info)
       ps[1]  += (ty - ps[1]) * l;
       zoomv  += (RAMEN_LAUNCH_ZOOM - zoomv) * l;
    }
+   rm->cam_ps[0]    = ps[0];
+   rm->cam_ps[1]    = ps[1];
+   rm->cam_zoom     = zoomv;
+   rm->cam_pivot[0] = pivot[0];
+   rm->cam_pivot[1] = pivot[1];
+   rm->cam_s        = S;
+   rm->cam_w        = width;
+   rm->cam_h        = height;
+   /* the accelerometer only while a wheel is on screen to show it */
+   ramen_imu_set(rm, !rm->saver
+         && (rm->state == RAMEN_SYSTEM || rm->state == RAMEN_GAME
+             || rm->state == RAMEN_LAUNCHING || rm->state == RAMEN_RETURNING));
 
    /* The system spheres. In a sequence the selected one is driven by the
     * timeline and the neighbours retract past their edges. */
@@ -3527,12 +4091,16 @@ static bool ramen_still(ramen_handle_t *rm)
    {
       case RAMEN_SYSTEM:
          return rm->settled && !rm->boot_spin && rm->label >= 1.0f
-            && rm->jiggle <= 0.0f && rm->notice_t <= 0.0f && hud_still;
+            && rm->jiggle <= 0.0f && rm->notice_t <= 0.0f && hud_still
+            && !rm->drag && fabsf(rm->wheel_vel) < 2.0f
+            && fabsf(rm->wheel - rm->wheel_target) < 0.1f;
       case RAMEN_USB:
          return rm->notice_t <= 0.0f;
       case RAMEN_GAME:
          return rm->gsettled && rm->mon >= 1.0f
-            && rm->gintro >= rm->gintro_len;
+            && rm->gintro >= rm->gintro_len
+            && !rm->drag && !rm->gcoast && fabsf(rm->gwheel_vel) < 2.0f
+            && fabsf(rm->gwheel - rm->gwheel_target) < 0.1f;
       case RAMEN_INGAME:
          return rm->ig_v >= 1.0f && !rm->ig_closing
             && !(rm->ig_degauss >= 0.0f && rm->ig_degauss < RAMEN_DEGAUSS_S)
@@ -3815,6 +4383,14 @@ static void ramen_toggle(void *data, bool on)
    ramen_handle_t *rm = (ramen_handle_t*)data;
    bool running;
 
+   if (rm && !on)
+   {
+      /* a game is taking over: nothing to shake, and no finger to lift */
+      ramen_imu_set(rm, false);
+      rm->drag       = 0;
+      rm->gcoast     = false;
+      rm->touch_down = false;
+   }
    if (!rm || !on || !rm->started)
       return;
    running      = !retroarch_ctl(RARCH_CTL_IS_DUMMY_CORE, NULL);

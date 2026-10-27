@@ -117,19 +117,19 @@ static const char *const ramen_roots[] = { "/data", RAMEN_SD_DIR };
 
 /* Tube radius and sphere radius as a fraction of the screen side. */
 #define RAMEN_TUBE_R      0.65f
-#define RAMEN_SPHERE_R    0.16f
+#define RAMEN_SPHERE_R    0.19f
 
 /* Detent spring: natural frequency and damping ratio (design: 0.6-0.8). */
-#define RAMEN_SPRING_HZ   2.5f
-#define RAMEN_SPRING_ZETA 0.3f
+#define RAMEN_SPRING_HZ   2.235f
+#define RAMEN_SPRING_ZETA 0.315f
 
 /* Boot spin: exponential friction, wheel starts this far back. Under
  * friction alone it would coast to RAMEN_BOOT_OVERRUN degrees past the
  * target; the spring takes over before that, at the point where it brakes
  * rather than pulls, so the wheel never speeds up into the detent. */
-#define RAMEN_BOOT_TURNS  3.0f
-#define RAMEN_BOOT_FRICTION 3.5f
-#define RAMEN_BOOT_OVERRUN  45.0f
+#define RAMEN_BOOT_TURNS  1.875f
+#define RAMEN_BOOT_FRICTION 2.65f
+#define RAMEN_BOOT_OVERRUN  60.0f
 
 /* Camera: a spring trailing the sphere, and the game view's zoom. */
 #define RAMEN_CAM_HZ      1.6f
@@ -147,9 +147,9 @@ static const char *const ramen_roots[] = { "/data", RAMEN_SD_DIR };
  * leaves the frame, and the picture fades out partway through the dive.
  * Coming back from a game plays it in reverse: fade in on the glass, then
  * pull back out to the game view. */
-#define RAMEN_LAUNCH_S    0.6f
-#define RAMEN_LAUNCH_ZOOM 2.9f
-#define RAMEN_LAUNCH_FADE 0.5f    /* the dive's progress when the fade starts */
+#define RAMEN_LAUNCH_S    0.5f
+#define RAMEN_LAUNCH_ZOOM 2.5f
+#define RAMEN_LAUNCH_FADE 0.33f    /* the dive's progress when the fade starts */
 /* Once the sphere has parked, the games come out of it one after the
  * other: each bursts from the same point inside the sphere to its own
  * slot, the selected one first and the trailing ones staggered behind it,
@@ -1971,14 +1971,10 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
 
    if (rm->boot_spin)
    {
-      float w   = 2.0f * (float)M_PI * RAMEN_SPRING_HZ;
-      float d;
-
       int slot;
 
       rm->wheel_vel *= expf(-RAMEN_BOOT_FRICTION * dt);
       rm->wheel     += rm->wheel_vel * dt;
-      d              = rm->wheel_target - rm->wheel;
       /* a tick each time a sphere crosses a slot boundary */
       slot = (int)floorf((rm->wheel - rm->wheel_target) / RAMEN_SLOT_DEG);
       if (slot != rm->boot_slot)
@@ -1986,10 +1982,7 @@ static void ramen_update(ramen_handle_t *rm, retro_time_t now)
          rm->boot_slot = slot;
          ramen_snd_play(SND_TICK);
       }
-      /* Hand over once the spring's damping would outweigh its pull:
-       * w^2 d <= 2 zeta w v. The wheel then only decelerates. */
-      if (d <= 2.0f * RAMEN_SPRING_ZETA * rm->wheel_vel / w
-            || rm->wheel_vel < 20.0f)
+      if (rm->wheel_vel < 75.0f)
          rm->boot_spin = false;
    }
    else
@@ -3481,7 +3474,7 @@ static int ramen_entry_action(void *userdata, menu_entry_t *entry,
                if (!rm->settled)
                   break;
                rm->system        = ramen_selected_system(rm);
-               rm->jiggle        = 1.0f;
+               rm->jiggle        = 1.6f;
                ramen_snd_play(SND_CONFIRM);
                rm->seq           = 0.0f;
                rm->state         = RAMEN_LAUNCHING;
